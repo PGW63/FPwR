@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <deque>
@@ -22,6 +23,14 @@
 
 namespace
 {
+
+using Clock = std::chrono::steady_clock;
+using Ms = std::chrono::duration<double, std::milli>;
+
+double elapsed_ms(const Clock::time_point & from)
+{
+  return std::chrono::duration_cast<Ms>(Clock::now() - from).count();
+}
 
 struct Point3
 {
@@ -221,24 +230,37 @@ public:
 private:
   rclcpp_action::GoalResponse handle_goal(
     const rclcpp_action::GoalUUID &,
-    std::shared_ptr<const FindBarPlane::Goal>)
+    std::shared_ptr<const FindBarPlane::Goal> goal)
   {
+    RCLCPP_INFO(
+      get_logger(),
+      "Received find_bar_plane goal: max_range=%.3f threshold=%.3f min_inliers=%d "
+      "max_iterations=%d approach_offset=%.3f accumulation_frames=%d",
+      goal ? goal->max_range_m : -1.0F,
+      goal ? goal->distance_threshold_m : -1.0F,
+      goal ? goal->min_inliers : -1,
+      goal ? goal->max_iterations : -1,
+      goal ? goal->approach_offset_m : -1.0F,
+      goal ? goal->accumulation_frames : -1);
     return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
   }
 
   rclcpp_action::CancelResponse handle_cancel(
     const std::shared_ptr<GoalHandleFindBarPlane>)
   {
+    RCLCPP_INFO(get_logger(), "Received find_bar_plane cancel");
     return rclcpp_action::CancelResponse::ACCEPT;
   }
 
   void handle_accepted(const std::shared_ptr<GoalHandleFindBarPlane> goal_handle)
   {
+    RCLCPP_INFO(get_logger(), "find_bar_plane goal accepted");
     std::thread{std::bind(&FindStartBarNode::execute, this, goal_handle)}.detach();
   }
 
   void execute(const std::shared_ptr<GoalHandleFindBarPlane> goal_handle)
   {
+    const auto start_time = Clock::now();
     const auto goal = goal_handle->get_goal();
     auto result = std::make_shared<FindBarPlane::Result>();
 
@@ -251,6 +273,7 @@ private:
     if (clouds.empty()) {
       result->success = false;
       result->message = "No PointCloud2 has been received yet.";
+      RCLCPP_WARN(get_logger(), "find_bar_plane failed: %s", result->message.c_str());
       goal_handle->succeed(result);
       return;
     }
@@ -271,6 +294,13 @@ private:
       clouds.erase(clouds.begin(), clouds.end() - accumulation_frames);
     }
 
+    RCLCPP_INFO(
+      get_logger(),
+      "Starting plane extraction: buffered_frames=%zu requested_frames=%d used_candidates=%zu "
+      "max_range=%.3f threshold=%.3f min_inliers=%d iterations=%d offset=%.3f",
+      recent_cloud_count(), accumulation_frames, clouds.size(), max_range_m,
+      distance_threshold_m, min_inliers, max_iterations, approach_offset_m);
+
     Point3 robot_position;
     try {
       robot_position = transform_origin(
@@ -278,9 +308,14 @@ private:
     } catch (const tf2::TransformException & ex) {
       result->success = false;
       result->message = std::string("Failed to lookup robot transform: ") + ex.what();
+      RCLCPP_WARN(get_logger(), "find_bar_plane failed: %s", result->message.c_str());
       goal_handle->succeed(result);
       return;
     }
+
+    RCLCPP_INFO(
+      get_logger(), "Robot pose for extraction: frame=%s robot_frame=%s xy=(%.3f, %.3f)",
+      target_frame_.c_str(), robot_frame_.c_str(), robot_position.x, robot_position.y);
 
     std::vector<Point3> points;
     int used_frames = 0;
@@ -290,6 +325,9 @@ private:
           target_frame_, cloud->header.frame_id, cloud->header.stamp,
           rclcpp::Duration::from_seconds(0.05));
         const auto frame_points = extract_points(*cloud, transform, robot_position, max_range_m);
+        RCLCPP_INFO(
+          get_logger(), "Accumulated cloud frame: source_frame=%s raw_points=%u kept_points=%zu",
+          cloud->header.frame_id.c_str(), cloud->width * cloud->height, frame_points.size());
         points.insert(points.end(), frame_points.begin(), frame_points.end());
         ++used_frames;
       } catch (const tf2::TransformException & ex) {
@@ -304,6 +342,9 @@ private:
     if (points.size() < 3) {
       result->success = false;
       result->message = "Not enough transformed valid points within max_range_m.";
+      RCLCPP_WARN(
+        get_logger(), "find_bar_plane failed: %s used_frames=%d points=%zu",
+        result->message.c_str(), used_frames, points.size());
       goal_handle->succeed(result);
       return;
     }
@@ -318,6 +359,7 @@ private:
       if (goal_handle->is_canceling()) {
         result->success = false;
         result->message = "Goal canceled.";
+        RCLCPP_INFO(get_logger(), "find_bar_plane canceled after %.2f ms", elapsed_ms(start_time));
         goal_handle->canceled(result);
         return;
       }
@@ -374,6 +416,7 @@ private:
       if (inlier_indices.empty()) {
         result->success = false;
         result->message = "Plane found, but could not determine a usable edge point.";
+        RCLCPP_WARN(get_logger(), "find_bar_plane failed: %s", result->message.c_str());
         goal_handle->succeed(result);
         return;
       }
@@ -390,6 +433,7 @@ private:
       if (plane_to_robot_norm < 1.0e-6F) {
         result->success = false;
         result->message = "Plane found, but robot is too close to the plane centroid direction.";
+        RCLCPP_WARN(get_logger(), "find_bar_plane failed: %s", result->message.c_str());
         goal_handle->succeed(result);
         return;
       }
@@ -416,6 +460,7 @@ private:
       if (distance_to_edge < 1.0e-6F) {
         result->success = false;
         result->message = "Plane found, but robot is already on the selected edge point.";
+        RCLCPP_WARN(get_logger(), "find_bar_plane failed: %s", result->message.c_str());
         goal_handle->succeed(result);
         return;
       }
@@ -430,17 +475,35 @@ private:
       result->target_x_m = edge_point.x + direction_x * approach_offset_m;
       result->target_y_m = edge_point.y + direction_y * approach_offset_m;
       result->distance_to_edge_m = distance_to_edge;
+      RCLCPP_INFO(
+        get_logger(),
+        "Plane edge selected: edge=(%.3f, %.3f) target=(%.3f, %.3f) "
+        "distance_to_edge=%.3f offset=%.3f plane=[%.3f %.3f %.3f %.3f]",
+        result->edge_x_m, result->edge_y_m, result->target_x_m, result->target_y_m,
+        result->distance_to_edge_m, approach_offset_m,
+        best_plane.a, best_plane.b, best_plane.c, best_plane.d);
     } else {
       result->message = "No plane reached min_inliers.";
+      RCLCPP_WARN(
+        get_logger(), "find_bar_plane failed: %s best_inliers=%d min_inliers=%d",
+        result->message.c_str(), best_inliers, min_inliers);
     }
 
     RCLCPP_INFO(
       get_logger(),
-      "RANSAC result: success=%s frames=%d points=%zu inliers=%d threshold=%.3f max_range=%.2f target=(%.3f, %.3f)",
+      "RANSAC result: success=%s frames=%d points=%zu inliers=%d threshold=%.3f "
+      "max_range=%.2f target=(%.3f, %.3f) elapsed=%.2f ms",
       result->success ? "true" : "false", used_frames, points.size(), best_inliers,
-      distance_threshold_m, max_range_m, result->target_x_m, result->target_y_m);
+      distance_threshold_m, max_range_m, result->target_x_m, result->target_y_m,
+      elapsed_ms(start_time));
 
     goal_handle->succeed(result);
+  }
+
+  size_t recent_cloud_count()
+  {
+    std::lock_guard<std::mutex> lock(cloud_mutex_);
+    return recent_clouds_.size();
   }
 
   std::string cloud_topic_;
