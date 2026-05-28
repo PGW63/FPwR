@@ -1,23 +1,8 @@
-# Goal
-# Values <= 0 use the node parameters.
-float32 max_range_m
-float32 distance_threshold_m
-int32 min_inliers
-int32 max_iterations
-float32 approach_offset_m
-int32 accumulation_frames
+bool start
 ---
 bool success
-string message
-float32[] plane_coefficients
-int32 inliers
-string frame_id
-float32 edge_x_m
-float32 edge_y_m
 float32 target_x_m
 float32 target_y_m
-float32 distance_to_edge_m
-int32 used_frames
 ---
-int32 current_iteration
-int32 best_inliers
+string state
+int32 progress_percent
