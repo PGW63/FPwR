@@ -11,7 +11,7 @@
 #include <thread>
 #include <vector>
 
-#include "find_start_bar/action/find_bar_plane.hpp"
+#include "inha_interfaces/action/find_bar_plane.hpp"
 #include "geometry_msgs/msg/transform_stamped.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
@@ -26,6 +26,7 @@ namespace
 
 using Clock = std::chrono::steady_clock;
 using Ms = std::chrono::duration<double, std::milli>;
+constexpr double kPi = 3.14159265358979323846;
 
 double elapsed_ms(const Clock::time_point & from)
 {
@@ -112,7 +113,13 @@ std::vector<Point3> extract_points(
   const sensor_msgs::msg::PointCloud2 & cloud,
   const geometry_msgs::msg::TransformStamped & transform,
   const Point3 & robot_position,
-  const float max_range_m)
+  const float roi_x_min_m,
+  const float roi_x_max_m,
+  const float roi_y_min_m,
+  const float roi_y_max_m,
+  const float roi_z_min_m,
+  const float roi_z_max_m,
+  const float robot_clearance_m)
 {
   std::vector<Point3> points;
   const int x_offset = field_offset(cloud, "x");
@@ -124,7 +131,7 @@ std::vector<Point3> extract_points(
 
   const size_t count = static_cast<size_t>(cloud.width) * static_cast<size_t>(cloud.height);
   points.reserve(count);
-  const float max_range_sq = max_range_m * max_range_m;
+  const float robot_clearance_sq = robot_clearance_m * robot_clearance_m;
 
   for (size_t i = 0; i < count; ++i) {
     const size_t point_start = i * cloud.point_step;
@@ -141,10 +148,20 @@ std::vector<Point3> extract_points(
     const Point3 map_point = transform_point({x, y, z}, transform);
     const float dx = map_point.x - robot_position.x;
     const float dy = map_point.y - robot_position.y;
-    const float range_sq = dx * dx + dy * dy;
-    if (range_sq <= max_range_sq) {
-      points.push_back(map_point);
+    if (dx < roi_x_min_m || dx > roi_x_max_m || dy < roi_y_min_m || dy > roi_y_max_m) {
+      continue;
     }
+
+    if (map_point.z < roi_z_min_m || map_point.z > roi_z_max_m) {
+      continue;
+    }
+
+    const float robot_distance_sq = dx * dx + dy * dy;
+    if (robot_distance_sq <= robot_clearance_sq) {
+      continue;
+    }
+
+    points.push_back(map_point);
   }
 
   return points;
@@ -179,27 +196,158 @@ float point_plane_distance(const Point3 & point, const Plane & plane)
   return std::fabs(plane.a * point.x + plane.b * point.y + plane.c * point.z + plane.d);
 }
 
+int remove_vertical_planes(
+  std::vector<Point3> & points,
+  const int max_planes,
+  const int max_iterations,
+  const float distance_threshold_m,
+  const int min_inliers,
+  const float max_abs_normal_z,
+  std::mt19937 & rng)
+{
+  int total_removed = 0;
+
+  for (int plane_index = 0; plane_index < max_planes; ++plane_index) {
+    if (points.size() < 3) {
+      break;
+    }
+
+    std::uniform_int_distribution<size_t> sample_index(0, points.size() - 1);
+    Plane best_plane;
+    std::vector<size_t> best_inliers;
+
+    for (int iteration = 0; iteration < max_iterations; ++iteration) {
+      const size_t i1 = sample_index(rng);
+      const size_t i2 = sample_index(rng);
+      const size_t i3 = sample_index(rng);
+      if (i1 == i2 || i1 == i3 || i2 == i3) {
+        continue;
+      }
+
+      Plane candidate;
+      if (!plane_from_points(points[i1], points[i2], points[i3], candidate)) {
+        continue;
+      }
+      if (std::fabs(candidate.c) > max_abs_normal_z) {
+        continue;
+      }
+
+      std::vector<size_t> inliers;
+      inliers.reserve(points.size());
+      for (size_t i = 0; i < points.size(); ++i) {
+        if (point_plane_distance(points[i], candidate) <= distance_threshold_m) {
+          inliers.push_back(i);
+        }
+      }
+
+      if (inliers.size() > best_inliers.size()) {
+        best_inliers = std::move(inliers);
+        best_plane = candidate;
+      }
+    }
+
+    if (static_cast<int>(best_inliers.size()) < min_inliers) {
+      break;
+    }
+
+    (void)best_plane;
+    std::vector<bool> remove_mask(points.size(), false);
+    for (const size_t index : best_inliers) {
+      remove_mask[index] = true;
+    }
+
+    std::vector<Point3> kept_points;
+    kept_points.reserve(points.size() - best_inliers.size());
+    for (size_t i = 0; i < points.size(); ++i) {
+      if (!remove_mask[i]) {
+        kept_points.push_back(points[i]);
+      }
+    }
+
+    total_removed += static_cast<int>(best_inliers.size());
+    points.swap(kept_points);
+  }
+
+  return total_removed;
+}
+
+sensor_msgs::msg::PointCloud2 make_point_cloud_msg(
+  const std::vector<Point3> & points,
+  const std::vector<size_t> & indices,
+  const std::string & frame_id,
+  const rclcpp::Time & stamp)
+{
+  sensor_msgs::msg::PointCloud2 cloud;
+  cloud.header.frame_id = frame_id;
+  cloud.header.stamp = stamp;
+  cloud.height = 1;
+  cloud.width = static_cast<uint32_t>(indices.size());
+  cloud.is_bigendian = false;
+  cloud.is_dense = true;
+  cloud.point_step = 3 * sizeof(float);
+  cloud.row_step = cloud.point_step * cloud.width;
+  cloud.fields.resize(3);
+
+  cloud.fields[0].name = "x";
+  cloud.fields[0].offset = 0;
+  cloud.fields[0].datatype = sensor_msgs::msg::PointField::FLOAT32;
+  cloud.fields[0].count = 1;
+  cloud.fields[1].name = "y";
+  cloud.fields[1].offset = sizeof(float);
+  cloud.fields[1].datatype = sensor_msgs::msg::PointField::FLOAT32;
+  cloud.fields[1].count = 1;
+  cloud.fields[2].name = "z";
+  cloud.fields[2].offset = 2 * sizeof(float);
+  cloud.fields[2].datatype = sensor_msgs::msg::PointField::FLOAT32;
+  cloud.fields[2].count = 1;
+
+  cloud.data.resize(static_cast<size_t>(cloud.row_step));
+  for (size_t i = 0; i < indices.size(); ++i) {
+    const auto & point = points[indices[i]];
+    const size_t offset = i * cloud.point_step;
+    std::memcpy(cloud.data.data() + offset, &point.x, sizeof(float));
+    std::memcpy(cloud.data.data() + offset + sizeof(float), &point.y, sizeof(float));
+    std::memcpy(cloud.data.data() + offset + 2 * sizeof(float), &point.z, sizeof(float));
+  }
+
+  return cloud;
+}
+
 }  // namespace
 
 class FindStartBarNode : public rclcpp::Node
 {
 public:
-  using FindBarPlane = find_start_bar::action::FindBarPlane;
+  using FindBarPlane = inha_interfaces::action::FindBarPlane;
   using GoalHandleFindBarPlane = rclcpp_action::ServerGoalHandle<FindBarPlane>;
 
   FindStartBarNode()
   : Node("find_start_bar_node")
   {
     cloud_topic_ = declare_parameter<std::string>("cloud_topic", "/livox/lidar");
-    default_max_range_m_ = declare_parameter<double>("max_range_m", 2.0);
-    default_distance_threshold_m_ = declare_parameter<double>("distance_threshold_m", 0.05);
-    default_min_inliers_ = declare_parameter<int>("min_inliers", 200);
+    default_roi_x_min_m_ = declare_parameter<double>("roi_x_min_m", 0.0);
+    default_roi_x_max_m_ = declare_parameter<double>("roi_x_max_m", 1.5);
+    default_roi_y_min_m_ = declare_parameter<double>("roi_y_min_m", -0.5);
+    default_roi_y_max_m_ = declare_parameter<double>("roi_y_max_m", 0.5);
+    default_roi_z_min_m_ = declare_parameter<double>("roi_z_min_m", 0.5);
+    default_roi_z_max_m_ = declare_parameter<double>("roi_z_max_m", 1.2);
+    default_robot_clearance_m_ = declare_parameter<double>("robot_clearance_m", 0.45);
+    default_distance_threshold_m_ = declare_parameter<double>("distance_threshold_m", 0.02);
+    default_max_plane_tilt_deg_ = declare_parameter<double>("max_plane_tilt_deg", 10.0);
+    remove_walls_ = declare_parameter<bool>("remove_walls", true);
+    wall_max_planes_ = declare_parameter<int>("wall_max_planes", 2);
+    wall_distance_threshold_m_ = declare_parameter<double>("wall_distance_threshold_m", 0.03);
+    wall_min_inliers_ = declare_parameter<int>("wall_min_inliers", 300);
+    wall_max_abs_normal_z_ = declare_parameter<double>("wall_max_abs_normal_z", 0.25);
+    default_min_inliers_ = declare_parameter<int>("min_inliers", 500);
     default_max_iterations_ = declare_parameter<int>("max_iterations", 300);
     default_approach_offset_m_ = declare_parameter<double>("approach_offset_m", 0.5);
     default_accumulation_frames_ = declare_parameter<int>("accumulation_frames", 10);
     max_stored_frames_ = declare_parameter<int>("max_stored_frames", 10);
     target_frame_ = declare_parameter<std::string>("target_frame", "map");
     robot_frame_ = declare_parameter<std::string>("robot_frame", "base");
+    debug_plane_topic_ = declare_parameter<std::string>(
+      "debug_plane_topic", "/find_start_bar/plane_inliers");
 
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -213,6 +361,8 @@ public:
           recent_clouds_.pop_front();
         }
       });
+    debug_plane_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
+      debug_plane_topic_, rclcpp::QoS(1).reliable());
 
     action_server_ = rclcpp_action::create_server<FindBarPlane>(
       this,
@@ -223,8 +373,13 @@ public:
 
     RCLCPP_INFO(
       get_logger(),
-      "FindStartBar action server ready. cloud_topic=%s action=find_bar_plane target_frame=%s robot_frame=%s",
-      cloud_topic_.c_str(), target_frame_.c_str(), robot_frame_.c_str());
+      "FindStartBar action server ready. cloud_topic=%s action=find_bar_plane target_frame=%s "
+      "robot_frame=%s debug_plane_topic=%s roi_x=[%.2f, %.2f] roi_y=[%.2f, %.2f] roi_z=[%.2f, %.2f] "
+      "robot_clearance=%.2f max_plane_tilt=%.1f deg remove_walls=%s",
+      cloud_topic_.c_str(), target_frame_.c_str(), robot_frame_.c_str(),
+      debug_plane_topic_.c_str(), default_roi_x_min_m_, default_roi_x_max_m_,
+      default_roi_y_min_m_, default_roi_y_max_m_, default_roi_z_min_m_, default_roi_z_max_m_,
+      default_robot_clearance_m_, default_max_plane_tilt_deg_, remove_walls_ ? "true" : "false");
   }
 
 private:
@@ -273,8 +428,18 @@ private:
       return;
     }
 
-    const float max_range_m = static_cast<float>(default_max_range_m_);
+    const float roi_x_min_m = static_cast<float>(default_roi_x_min_m_);
+    const float roi_x_max_m = static_cast<float>(default_roi_x_max_m_);
+    const float roi_y_min_m = static_cast<float>(default_roi_y_min_m_);
+    const float roi_y_max_m = static_cast<float>(default_roi_y_max_m_);
+    const float roi_z_min_m = static_cast<float>(default_roi_z_min_m_);
+    const float roi_z_max_m = static_cast<float>(default_roi_z_max_m_);
+    const float robot_clearance_m = static_cast<float>(default_robot_clearance_m_);
     const float distance_threshold_m = static_cast<float>(default_distance_threshold_m_);
+    const float min_abs_normal_z = static_cast<float>(
+      std::cos(default_max_plane_tilt_deg_ * kPi / 180.0));
+    const float wall_distance_threshold_m = static_cast<float>(wall_distance_threshold_m_);
+    const float wall_max_abs_normal_z = static_cast<float>(wall_max_abs_normal_z_);
     const int min_inliers = default_min_inliers_;
     const int max_iterations = default_max_iterations_;
     const float approach_offset_m = static_cast<float>(default_approach_offset_m_);
@@ -287,9 +452,15 @@ private:
     RCLCPP_INFO(
       get_logger(),
       "Starting plane extraction: buffered_frames=%zu requested_frames=%d used_candidates=%zu "
-      "max_range=%.3f threshold=%.3f min_inliers=%d iterations=%d offset=%.3f",
-      recent_cloud_count(), accumulation_frames, clouds.size(), max_range_m,
-      distance_threshold_m, min_inliers, max_iterations, approach_offset_m);
+      "roi_x=[%.3f, %.3f] roi_y=[%.3f, %.3f] roi_z=[%.3f, %.3f] "
+      "robot_clearance=%.3f threshold=%.3f "
+      "max_tilt=%.1fdeg min_abs_normal_z=%.3f remove_walls=%s wall_threshold=%.3f "
+      "wall_min_inliers=%d wall_max_abs_normal_z=%.3f min_inliers=%d iterations=%d offset=%.3f",
+      recent_cloud_count(), accumulation_frames, clouds.size(), roi_x_min_m, roi_x_max_m,
+      roi_y_min_m, roi_y_max_m, roi_z_min_m, roi_z_max_m, robot_clearance_m, distance_threshold_m,
+      default_max_plane_tilt_deg_, min_abs_normal_z, remove_walls_ ? "true" : "false",
+      wall_distance_threshold_m, wall_min_inliers_, wall_max_abs_normal_z, min_inliers,
+      max_iterations, approach_offset_m);
 
     Point3 robot_position;
     try {
@@ -315,7 +486,9 @@ private:
         const auto transform = tf_buffer_->lookupTransform(
           target_frame_, cloud->header.frame_id, cloud->header.stamp,
           rclcpp::Duration::from_seconds(0.05));
-        const auto frame_points = extract_points(*cloud, transform, robot_position, max_range_m);
+        const auto frame_points = extract_points(
+          *cloud, transform, robot_position, roi_x_min_m, roi_x_max_m, roi_y_min_m,
+          roi_y_max_m, roi_z_min_m, roi_z_max_m, robot_clearance_m);
         RCLCPP_INFO(
           get_logger(), "Accumulated cloud frame: source_frame=%s raw_points=%u kept_points=%zu",
           cloud->header.frame_id.c_str(), cloud->width * cloud->height, frame_points.size());
@@ -328,18 +501,34 @@ private:
       }
     }
 
+    std::mt19937 rng{std::random_device{}()};
+    if (remove_walls_ && points.size() >= 3) {
+      publish_feedback(goal_handle, "removing_walls", 30);
+      const size_t before_wall_removal = points.size();
+      const int removed_wall_points = remove_vertical_planes(
+        points, wall_max_planes_, max_iterations, wall_distance_threshold_m, wall_min_inliers_,
+        wall_max_abs_normal_z, rng);
+      RCLCPP_INFO(
+        get_logger(),
+        "Wall removal complete: before=%zu removed=%d remaining=%zu max_planes=%d threshold=%.3f "
+        "min_inliers=%d max_abs_normal_z=%.3f",
+        before_wall_removal, removed_wall_points, points.size(), wall_max_planes_,
+        wall_distance_threshold_m, wall_min_inliers_, wall_max_abs_normal_z);
+    }
+
     if (points.size() < 3) {
       result->success = false;
       RCLCPP_WARN(
         get_logger(),
-        "find_bar_plane failed: Not enough transformed valid points within max_range_m. "
-        "used_frames=%d points=%zu",
-        used_frames, points.size());
+        "find_bar_plane failed: Not enough transformed valid points within ROI. "
+        "roi_x=[%.2f, %.2f] roi_y=[%.2f, %.2f] roi_z=[%.2f, %.2f] "
+        "robot_clearance=%.2f used_frames=%d points=%zu",
+        roi_x_min_m, roi_x_max_m, roi_y_min_m, roi_y_max_m, roi_z_min_m, roi_z_max_m,
+        robot_clearance_m, used_frames, points.size());
       goal_handle->succeed(result);
       return;
     }
 
-    std::mt19937 rng{std::random_device{}()};
     std::uniform_int_distribution<size_t> sample_index(0, points.size() - 1);
 
     Plane best_plane;
@@ -363,6 +552,9 @@ private:
 
       Plane candidate;
       if (!plane_from_points(points[i1], points[i2], points[i3], candidate)) {
+        continue;
+      }
+      if (std::fabs(candidate.c) < min_abs_normal_z) {
         continue;
       }
 
@@ -415,6 +607,12 @@ private:
       inlier_centroid.y *= inv_inliers;
       inlier_centroid.z *= inv_inliers;
 
+      debug_plane_pub_->publish(
+        make_point_cloud_msg(points, inlier_indices, target_frame_, now()));
+      RCLCPP_INFO(
+        get_logger(), "Published debug plane cloud: topic=%s points=%zu frame=%s",
+        debug_plane_topic_.c_str(), inlier_indices.size(), target_frame_.c_str());
+
       float plane_to_robot_x = robot_position.x - inlier_centroid.x;
       float plane_to_robot_y = robot_position.y - inlier_centroid.y;
       const float plane_to_robot_norm =
@@ -460,26 +658,33 @@ private:
 
       result->target_x_m = edge_point.x + direction_x * approach_offset_m;
       result->target_y_m = edge_point.y + direction_y * approach_offset_m;
+      result->target_z_m = edge_point.z;
       RCLCPP_INFO(
         get_logger(),
-        "Plane edge selected: edge=(%.3f, %.3f) target=(%.3f, %.3f) "
+        "Plane edge selected: edge=(%.3f, %.3f, %.3f) target=(%.3f, %.3f, %.3f) "
         "distance_to_edge=%.3f offset=%.3f plane=[%.3f %.3f %.3f %.3f]",
-        edge_point.x, edge_point.y, result->target_x_m, result->target_y_m,
+        edge_point.x, edge_point.y, edge_point.z,
+        result->target_x_m, result->target_y_m, result->target_z_m,
         distance_to_edge, approach_offset_m,
         best_plane.a, best_plane.b, best_plane.c, best_plane.d);
       publish_feedback(goal_handle, "succeeded", 100);
     } else {
       RCLCPP_WARN(
-        get_logger(), "find_bar_plane failed: No plane reached min_inliers. best_inliers=%d min_inliers=%d",
-        best_inliers, min_inliers);
+        get_logger(),
+        "find_bar_plane failed: No horizontal plane reached min_inliers. "
+        "best_inliers=%d min_inliers=%d min_abs_normal_z=%.3f",
+        best_inliers, min_inliers, min_abs_normal_z);
     }
 
     RCLCPP_INFO(
       get_logger(),
       "RANSAC result: success=%s frames=%d points=%zu inliers=%d threshold=%.3f "
-      "max_range=%.2f target=(%.3f, %.3f) elapsed=%.2f ms",
+      "roi_x=[%.2f, %.2f] roi_y=[%.2f, %.2f] roi_z=[%.2f, %.2f] "
+      "target=(%.3f, %.3f, %.3f) elapsed=%.2f ms",
       result->success ? "true" : "false", used_frames, points.size(), best_inliers,
-      distance_threshold_m, max_range_m, result->target_x_m, result->target_y_m,
+      distance_threshold_m, roi_x_min_m, roi_x_max_m, roi_y_min_m, roi_y_max_m,
+      roi_z_min_m, roi_z_max_m,
+      result->target_x_m, result->target_y_m, result->target_z_m,
       elapsed_ms(start_time));
 
     goal_handle->succeed(result);
@@ -503,8 +708,20 @@ private:
   }
 
   std::string cloud_topic_;
-  double default_max_range_m_{};
+  double default_roi_x_min_m_{};
+  double default_roi_x_max_m_{};
+  double default_roi_y_min_m_{};
+  double default_roi_y_max_m_{};
+  double default_roi_z_min_m_{};
+  double default_roi_z_max_m_{};
+  double default_robot_clearance_m_{};
   double default_distance_threshold_m_{};
+  double default_max_plane_tilt_deg_{};
+  bool remove_walls_{};
+  int wall_max_planes_{};
+  double wall_distance_threshold_m_{};
+  int wall_min_inliers_{};
+  double wall_max_abs_normal_z_{};
   double default_approach_offset_m_{};
   int default_min_inliers_{};
   int default_max_iterations_{};
@@ -512,10 +729,12 @@ private:
   int max_stored_frames_{};
   std::string target_frame_;
   std::string robot_frame_;
+  std::string debug_plane_topic_;
 
   std::mutex cloud_mutex_;
   std::deque<sensor_msgs::msg::PointCloud2::SharedPtr> recent_clouds_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr debug_plane_pub_;
   rclcpp_action::Server<FindBarPlane>::SharedPtr action_server_;
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;

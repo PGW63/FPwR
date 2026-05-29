@@ -11,15 +11,12 @@ find_package(action_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_action REQUIRED)
-find_package(rosidl_default_generators REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
+find_package(inha_interfaces REQUIRED)
 
-rosidl_generate_interfaces(${PROJECT_NAME}
-  "action/FindBarPlane.action"
-  DEPENDENCIES action_msgs
-)
+
 
 add_executable(find_start_bar_node src/find_start_bar.cpp)
 ament_target_dependencies(find_start_bar_node
@@ -29,12 +26,10 @@ ament_target_dependencies(find_start_bar_node
   sensor_msgs
   tf2
   tf2_ros
+  inha_interfaces
 )
 
-rosidl_get_typesupport_target(cpp_typesupport_target
-  ${PROJECT_NAME}
-  "rosidl_typesupport_cpp"
-)
+
 target_link_libraries(find_start_bar_node "${cpp_typesupport_target}")
 
 install(TARGETS find_start_bar_node
@@ -53,5 +48,4 @@ if(BUILD_TESTING)
   ament_lint_auto_find_test_dependencies()
 endif()
 
-ament_export_dependencies(rosidl_default_runtime)
 ament_package()

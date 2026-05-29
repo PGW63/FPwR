@@ -1,8 +1,0 @@
-bool start
----
-bool success
-float32 target_x_m
-float32 target_y_m
----
-string state
-int32 progress_percent
