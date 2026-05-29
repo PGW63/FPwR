@@ -1,14 +1,22 @@
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <deque>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <random>
+#include <sstream>
 #include <string>
 #include <thread>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <vector>
 
 #include "inha_interfaces/action/find_bar_plane.hpp"
@@ -31,6 +39,62 @@ constexpr double kPi = 3.14159265358979323846;
 double elapsed_ms(const Clock::time_point & from)
 {
   return std::chrono::duration_cast<Ms>(Clock::now() - from).count();
+}
+
+bool directory_exists(const std::string & path)
+{
+  struct stat info {};
+  return stat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode);
+}
+
+bool ensure_directory(const std::string & path)
+{
+  if (path.empty()) {
+    return false;
+  }
+
+  if (directory_exists(path)) {
+    return true;
+  }
+
+  std::string current;
+  current.reserve(path.size());
+  for (const char ch : path) {
+    current.push_back(ch);
+    if (ch != '/' || current.size() == 1) {
+      continue;
+    }
+
+    if (!directory_exists(current) && mkdir(current.c_str(), 0755) != 0 && errno != EEXIST) {
+      return false;
+    }
+  }
+
+  return directory_exists(path) || mkdir(path.c_str(), 0755) == 0 || errno == EEXIST;
+}
+
+std::string timestamp_string(const char * format)
+{
+  const std::time_t now = std::time(nullptr);
+  std::tm local_time {};
+  localtime_r(&now, &local_time);
+
+  std::ostringstream stream;
+  stream << std::put_time(&local_time, format);
+  return stream.str();
+}
+
+template<typename... Args>
+std::string format_message(const char * format, Args... args)
+{
+  const int size = std::snprintf(nullptr, 0, format, args...);
+  if (size <= 0) {
+    return format;
+  }
+
+  std::vector<char> buffer(static_cast<size_t>(size) + 1);
+  std::snprintf(buffer.data(), buffer.size(), format, args...);
+  return std::string(buffer.data(), static_cast<size_t>(size));
 }
 
 struct Point3
@@ -348,6 +412,10 @@ public:
     robot_frame_ = declare_parameter<std::string>("robot_frame", "base");
     debug_plane_topic_ = declare_parameter<std::string>(
       "debug_plane_topic", "/find_start_bar/plane_inliers");
+    log_directory_ = declare_parameter<std::string>(
+      "log_directory", "/home/nvidia/inha_log/module/find_start_bar");
+
+    initialize_file_logger();
 
     tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
     tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -371,15 +439,15 @@ public:
       std::bind(&FindStartBarNode::handle_cancel, this, std::placeholders::_1),
       std::bind(&FindStartBarNode::handle_accepted, this, std::placeholders::_1));
 
-    RCLCPP_INFO(
-      get_logger(),
+    log_info(
       "FindStartBar action server ready. cloud_topic=%s action=find_bar_plane target_frame=%s "
       "robot_frame=%s debug_plane_topic=%s roi_x=[%.2f, %.2f] roi_y=[%.2f, %.2f] roi_z=[%.2f, %.2f] "
-      "robot_clearance=%.2f max_plane_tilt=%.1f deg remove_walls=%s",
+      "robot_clearance=%.2f max_plane_tilt=%.1f deg remove_walls=%s log_file=%s",
       cloud_topic_.c_str(), target_frame_.c_str(), robot_frame_.c_str(),
       debug_plane_topic_.c_str(), default_roi_x_min_m_, default_roi_x_max_m_,
       default_roi_y_min_m_, default_roi_y_max_m_, default_roi_z_min_m_, default_roi_z_max_m_,
-      default_robot_clearance_m_, default_max_plane_tilt_deg_, remove_walls_ ? "true" : "false");
+      default_robot_clearance_m_, default_max_plane_tilt_deg_, remove_walls_ ? "true" : "false",
+      log_file_path_.empty() ? "disabled" : log_file_path_.c_str());
   }
 
 private:
@@ -388,24 +456,24 @@ private:
     std::shared_ptr<const FindBarPlane::Goal> goal)
   {
     if (!goal || !goal->start) {
-      RCLCPP_WARN(get_logger(), "Rejecting find_bar_plane goal: start=false");
+      log_warn("Rejecting find_bar_plane goal: start=false");
       return rclcpp_action::GoalResponse::REJECT;
     }
 
-    RCLCPP_INFO(get_logger(), "Received find_bar_plane goal: start=true");
+    log_info("Received find_bar_plane goal: start=true");
     return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
   }
 
   rclcpp_action::CancelResponse handle_cancel(
     const std::shared_ptr<GoalHandleFindBarPlane>)
   {
-    RCLCPP_INFO(get_logger(), "Received find_bar_plane cancel");
+    log_info("Received find_bar_plane cancel");
     return rclcpp_action::CancelResponse::ACCEPT;
   }
 
   void handle_accepted(const std::shared_ptr<GoalHandleFindBarPlane> goal_handle)
   {
-    RCLCPP_INFO(get_logger(), "find_bar_plane goal accepted");
+    log_info("find_bar_plane goal accepted");
     std::thread{std::bind(&FindStartBarNode::execute, this, goal_handle)}.detach();
   }
 
@@ -423,7 +491,7 @@ private:
 
     if (clouds.empty()) {
       result->success = false;
-      RCLCPP_WARN(get_logger(), "find_bar_plane failed: No PointCloud2 has been received yet.");
+      log_warn("find_bar_plane failed: No PointCloud2 has been received yet.");
       goal_handle->succeed(result);
       return;
     }
@@ -449,8 +517,7 @@ private:
       clouds.erase(clouds.begin(), clouds.end() - accumulation_frames);
     }
 
-    RCLCPP_INFO(
-      get_logger(),
+    log_info(
       "Starting plane extraction: buffered_frames=%zu requested_frames=%d used_candidates=%zu "
       "roi_x=[%.3f, %.3f] roi_y=[%.3f, %.3f] roi_z=[%.3f, %.3f] "
       "robot_clearance=%.3f threshold=%.3f "
@@ -469,13 +536,13 @@ private:
         tf_buffer_->lookupTransform(target_frame_, robot_frame_, tf2::TimePointZero));
     } catch (const tf2::TransformException & ex) {
       result->success = false;
-      RCLCPP_WARN(get_logger(), "find_bar_plane failed: Failed to lookup robot transform: %s", ex.what());
+      log_warn("find_bar_plane failed: Failed to lookup robot transform: %s", ex.what());
       goal_handle->succeed(result);
       return;
     }
 
-    RCLCPP_INFO(
-      get_logger(), "Robot pose for extraction: frame=%s robot_frame=%s xy=(%.3f, %.3f)",
+    log_info(
+      "Robot pose for extraction: frame=%s robot_frame=%s xy=(%.3f, %.3f)",
       target_frame_.c_str(), robot_frame_.c_str(), robot_position.x, robot_position.y);
 
     std::vector<Point3> points;
@@ -489,14 +556,14 @@ private:
         const auto frame_points = extract_points(
           *cloud, transform, robot_position, roi_x_min_m, roi_x_max_m, roi_y_min_m,
           roi_y_max_m, roi_z_min_m, roi_z_max_m, robot_clearance_m);
-        RCLCPP_INFO(
-          get_logger(), "Accumulated cloud frame: source_frame=%s raw_points=%u kept_points=%zu",
+        log_info(
+          "Accumulated cloud frame: source_frame=%s raw_points=%u kept_points=%zu",
           cloud->header.frame_id.c_str(), cloud->width * cloud->height, frame_points.size());
         points.insert(points.end(), frame_points.begin(), frame_points.end());
         ++used_frames;
       } catch (const tf2::TransformException & ex) {
-        RCLCPP_WARN_THROTTLE(
-          get_logger(), *get_clock(), 2000,
+        log_warn_throttle(
+          2000,
           "Skipping cloud frame because TF lookup failed: %s", ex.what());
       }
     }
@@ -508,8 +575,7 @@ private:
       const int removed_wall_points = remove_vertical_planes(
         points, wall_max_planes_, max_iterations, wall_distance_threshold_m, wall_min_inliers_,
         wall_max_abs_normal_z, rng);
-      RCLCPP_INFO(
-        get_logger(),
+      log_info(
         "Wall removal complete: before=%zu removed=%d remaining=%zu max_planes=%d threshold=%.3f "
         "min_inliers=%d max_abs_normal_z=%.3f",
         before_wall_removal, removed_wall_points, points.size(), wall_max_planes_,
@@ -518,8 +584,7 @@ private:
 
     if (points.size() < 3) {
       result->success = false;
-      RCLCPP_WARN(
-        get_logger(),
+      log_warn(
         "find_bar_plane failed: Not enough transformed valid points within ROI. "
         "roi_x=[%.2f, %.2f] roi_y=[%.2f, %.2f] roi_z=[%.2f, %.2f] "
         "robot_clearance=%.2f used_frames=%d points=%zu",
@@ -538,7 +603,7 @@ private:
     for (int iteration = 1; iteration <= max_iterations; ++iteration) {
       if (goal_handle->is_canceling()) {
         result->success = false;
-        RCLCPP_INFO(get_logger(), "find_bar_plane canceled after %.2f ms", elapsed_ms(start_time));
+        log_info("find_bar_plane canceled after %.2f ms", elapsed_ms(start_time));
         goal_handle->canceled(result);
         return;
       }
@@ -596,8 +661,8 @@ private:
 
       if (inlier_indices.empty()) {
         result->success = false;
-        RCLCPP_WARN(
-          get_logger(), "find_bar_plane failed: Plane found, but could not determine a usable edge point.");
+        log_warn(
+          "find_bar_plane failed: Plane found, but could not determine a usable edge point.");
         goal_handle->succeed(result);
         return;
       }
@@ -609,8 +674,8 @@ private:
 
       debug_plane_pub_->publish(
         make_point_cloud_msg(points, inlier_indices, target_frame_, now()));
-      RCLCPP_INFO(
-        get_logger(), "Published debug plane cloud: topic=%s points=%zu frame=%s",
+      log_info(
+        "Published debug plane cloud: topic=%s points=%zu frame=%s",
         debug_plane_topic_.c_str(), inlier_indices.size(), target_frame_.c_str());
 
       float plane_to_robot_x = robot_position.x - inlier_centroid.x;
@@ -619,8 +684,7 @@ private:
         std::sqrt(plane_to_robot_x * plane_to_robot_x + plane_to_robot_y * plane_to_robot_y);
       if (plane_to_robot_norm < 1.0e-6F) {
         result->success = false;
-        RCLCPP_WARN(
-          get_logger(),
+        log_warn(
           "find_bar_plane failed: Plane found, but robot is too close to the plane centroid direction.");
         goal_handle->succeed(result);
         return;
@@ -647,8 +711,8 @@ private:
       const float distance_to_edge = std::sqrt(dx * dx + dy * dy);
       if (distance_to_edge < 1.0e-6F) {
         result->success = false;
-        RCLCPP_WARN(
-          get_logger(), "find_bar_plane failed: Plane found, but robot is already on the selected edge point.");
+        log_warn(
+          "find_bar_plane failed: Plane found, but robot is already on the selected edge point.");
         goal_handle->succeed(result);
         return;
       }
@@ -659,8 +723,7 @@ private:
       result->target_x_m = edge_point.x + direction_x * approach_offset_m;
       result->target_y_m = edge_point.y + direction_y * approach_offset_m;
       result->target_z_m = edge_point.z;
-      RCLCPP_INFO(
-        get_logger(),
+      log_info(
         "Plane edge selected: edge=(%.3f, %.3f, %.3f) target=(%.3f, %.3f, %.3f) "
         "distance_to_edge=%.3f offset=%.3f plane=[%.3f %.3f %.3f %.3f]",
         edge_point.x, edge_point.y, edge_point.z,
@@ -669,15 +732,13 @@ private:
         best_plane.a, best_plane.b, best_plane.c, best_plane.d);
       publish_feedback(goal_handle, "succeeded", 100);
     } else {
-      RCLCPP_WARN(
-        get_logger(),
+      log_warn(
         "find_bar_plane failed: No horizontal plane reached min_inliers. "
         "best_inliers=%d min_inliers=%d min_abs_normal_z=%.3f",
         best_inliers, min_inliers, min_abs_normal_z);
     }
 
-    RCLCPP_INFO(
-      get_logger(),
+    log_info(
       "RANSAC result: success=%s frames=%d points=%zu inliers=%d threshold=%.3f "
       "roi_x=[%.2f, %.2f] roi_y=[%.2f, %.2f] roi_z=[%.2f, %.2f] "
       "target=(%.3f, %.3f, %.3f) elapsed=%.2f ms",
@@ -688,6 +749,76 @@ private:
       elapsed_ms(start_time));
 
     goal_handle->succeed(result);
+  }
+
+  void initialize_file_logger()
+  {
+    if (!ensure_directory(log_directory_)) {
+      RCLCPP_WARN(
+        get_logger(), "Failed to create log directory: %s error=%s",
+        log_directory_.c_str(), std::strerror(errno));
+      return;
+    }
+
+    log_file_path_ =
+      log_directory_ + "/find_start_bar_" + timestamp_string("%Y%m%d_%H%M%S") + ".log";
+    log_file_.open(log_file_path_, std::ios::out | std::ios::app);
+    if (!log_file_.is_open()) {
+      RCLCPP_WARN(get_logger(), "Failed to open log file: %s", log_file_path_.c_str());
+      log_file_path_.clear();
+      return;
+    }
+
+    append_log("INFO", "File logging started: path=" + log_file_path_);
+  }
+
+  void append_log(const std::string & level, const std::string & message)
+  {
+    std::lock_guard<std::mutex> lock(log_mutex_);
+    if (!log_file_.is_open()) {
+      return;
+    }
+
+    log_file_ << timestamp_string("%Y-%m-%d %H:%M:%S") << " [" << level << "] "
+              << message << '\n';
+    log_file_.flush();
+  }
+
+  template<typename... Args>
+  void log_info(const char * format, Args... args)
+  {
+    const std::string message = format_message(format, args...);
+    RCLCPP_INFO(get_logger(), "%s", message.c_str());
+    append_log("INFO", message);
+  }
+
+  template<typename... Args>
+  void log_warn(const char * format, Args... args)
+  {
+    const std::string message = format_message(format, args...);
+    RCLCPP_WARN(get_logger(), "%s", message.c_str());
+    append_log("WARN", message);
+  }
+
+  template<typename... Args>
+  void log_warn_throttle(const int duration_ms, const char * format, Args... args)
+  {
+    const std::string message = format_message(format, args...);
+    RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), duration_ms, "%s", message.c_str());
+
+    const auto now_time = Clock::now();
+    {
+      std::lock_guard<std::mutex> lock(log_mutex_);
+      if (last_throttled_file_log_time_.time_since_epoch().count() != 0 &&
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+          now_time - last_throttled_file_log_time_).count() < duration_ms)
+      {
+        return;
+      }
+      last_throttled_file_log_time_ = now_time;
+    }
+
+    append_log("WARN", message);
   }
 
   size_t recent_cloud_count()
@@ -730,9 +861,14 @@ private:
   std::string target_frame_;
   std::string robot_frame_;
   std::string debug_plane_topic_;
+  std::string log_directory_;
+  std::string log_file_path_;
 
   std::mutex cloud_mutex_;
+  std::mutex log_mutex_;
+  Clock::time_point last_throttled_file_log_time_{};
   std::deque<sensor_msgs::msg::PointCloud2::SharedPtr> recent_clouds_;
+  std::ofstream log_file_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr debug_plane_pub_;
   rclcpp_action::Server<FindBarPlane>::SharedPtr action_server_;
