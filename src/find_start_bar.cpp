@@ -175,8 +175,8 @@ int field_offset(const sensor_msgs::msg::PointCloud2 & cloud, const std::string 
 
 std::vector<Point3> extract_points(
   const sensor_msgs::msg::PointCloud2 & cloud,
-  const geometry_msgs::msg::TransformStamped & transform,
-  const Point3 & robot_position,
+  const geometry_msgs::msg::TransformStamped & cloud_to_map_transform,
+  const geometry_msgs::msg::TransformStamped & cloud_to_robot_transform,
   const float roi_x_min_m,
   const float roi_x_max_m,
   const float roi_y_min_m,
@@ -209,22 +209,23 @@ std::vector<Point3> extract_points(
       continue;
     }
 
-    const Point3 map_point = transform_point({x, y, z}, transform);
-    const float dx = map_point.x - robot_position.x;
-    const float dy = map_point.y - robot_position.y;
-    if (dx < roi_x_min_m || dx > roi_x_max_m || dy < roi_y_min_m || dy > roi_y_max_m) {
+    const Point3 robot_point = transform_point({x, y, z}, cloud_to_robot_transform);
+    if (robot_point.x < roi_x_min_m || robot_point.x > roi_x_max_m ||
+      robot_point.y < roi_y_min_m || robot_point.y > roi_y_max_m)
+    {
       continue;
     }
 
-    if (map_point.z < roi_z_min_m || map_point.z > roi_z_max_m) {
+    if (robot_point.z < roi_z_min_m || robot_point.z > roi_z_max_m) {
       continue;
     }
 
-    const float robot_distance_sq = dx * dx + dy * dy;
+    const float robot_distance_sq = robot_point.x * robot_point.x + robot_point.y * robot_point.y;
     if (robot_distance_sq <= robot_clearance_sq) {
       continue;
     }
 
+    const Point3 map_point = transform_point({x, y, z}, cloud_to_map_transform);
     points.push_back(map_point);
   }
 
@@ -553,12 +554,15 @@ private:
     publish_feedback(goal_handle, "accumulating_clouds", 20);
     for (const auto & cloud : clouds) {
       try {
-        const auto transform = tf_buffer_->lookupTransform(
+        const auto cloud_to_map_transform = tf_buffer_->lookupTransform(
           map_frame_, cloud->header.frame_id, cloud->header.stamp,
           rclcpp::Duration::from_seconds(0.05));
+        const auto cloud_to_robot_transform = tf_buffer_->lookupTransform(
+          robot_frame_, cloud->header.frame_id, cloud->header.stamp,
+          rclcpp::Duration::from_seconds(0.05));
         const auto frame_points = extract_points(
-          *cloud, transform, robot_position, roi_x_min_m, roi_x_max_m, roi_y_min_m,
-          roi_y_max_m, roi_z_min_m, roi_z_max_m, robot_clearance_m);
+          *cloud, cloud_to_map_transform, cloud_to_robot_transform, roi_x_min_m, roi_x_max_m,
+          roi_y_min_m, roi_y_max_m, roi_z_min_m, roi_z_max_m, robot_clearance_m);
         log_info(
           "Accumulated cloud frame: source_frame=%s raw_points=%u kept_points=%zu",
           cloud->header.frame_id.c_str(), cloud->width * cloud->height, frame_points.size());
