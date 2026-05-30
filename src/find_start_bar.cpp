@@ -406,10 +406,11 @@ public:
     default_min_inliers_ = declare_parameter<int>("min_inliers", 500);
     default_max_iterations_ = declare_parameter<int>("max_iterations", 300);
     default_approach_offset_m_ = declare_parameter<double>("approach_offset_m", 0.5);
+    map_z_offset_m_ = declare_parameter<double>("map_z_offset_m", -0.226);
     default_accumulation_frames_ = declare_parameter<int>("accumulation_frames", 10);
     max_stored_frames_ = declare_parameter<int>("max_stored_frames", 10);
-    target_frame_ = declare_parameter<std::string>("target_frame", "map");
-    robot_frame_ = declare_parameter<std::string>("robot_frame", "base");
+    map_frame_ = declare_parameter<std::string>("map_frame", "map");
+    robot_frame_ = declare_parameter<std::string>("robot_frame", "base_nav");
     debug_plane_topic_ = declare_parameter<std::string>(
       "debug_plane_topic", "/find_start_bar/plane_inliers");
     log_directory_ = declare_parameter<std::string>(
@@ -440,14 +441,14 @@ public:
       std::bind(&FindStartBarNode::handle_accepted, this, std::placeholders::_1));
 
     log_info(
-      "FindStartBar action server ready. cloud_topic=%s action=find_bar_plane target_frame=%s "
+      "FindStartBar action server ready. cloud_topic=%s action=find_bar_plane map_frame=%s "
       "robot_frame=%s debug_plane_topic=%s roi_x=[%.2f, %.2f] roi_y=[%.2f, %.2f] roi_z=[%.2f, %.2f] "
-      "robot_clearance=%.2f max_plane_tilt=%.1f deg remove_walls=%s log_file=%s",
-      cloud_topic_.c_str(), target_frame_.c_str(), robot_frame_.c_str(),
+      "robot_clearance=%.2f max_plane_tilt=%.1f deg map_z_offset=%.3f remove_walls=%s log_file=%s",
+      cloud_topic_.c_str(), map_frame_.c_str(), robot_frame_.c_str(),
       debug_plane_topic_.c_str(), default_roi_x_min_m_, default_roi_x_max_m_,
       default_roi_y_min_m_, default_roi_y_max_m_, default_roi_z_min_m_, default_roi_z_max_m_,
-      default_robot_clearance_m_, default_max_plane_tilt_deg_, remove_walls_ ? "true" : "false",
-      log_file_path_.empty() ? "disabled" : log_file_path_.c_str());
+      default_robot_clearance_m_, default_max_plane_tilt_deg_, map_z_offset_m_,
+      remove_walls_ ? "true" : "false", log_file_path_.empty() ? "disabled" : log_file_path_.c_str());
   }
 
 private:
@@ -511,6 +512,7 @@ private:
     const int min_inliers = default_min_inliers_;
     const int max_iterations = default_max_iterations_;
     const float approach_offset_m = static_cast<float>(default_approach_offset_m_);
+    const float map_z_offset_m = static_cast<float>(map_z_offset_m_);
     const int accumulation_frames = default_accumulation_frames_;
 
     if (static_cast<int>(clouds.size()) > accumulation_frames) {
@@ -522,18 +524,19 @@ private:
       "roi_x=[%.3f, %.3f] roi_y=[%.3f, %.3f] roi_z=[%.3f, %.3f] "
       "robot_clearance=%.3f threshold=%.3f "
       "max_tilt=%.1fdeg min_abs_normal_z=%.3f remove_walls=%s wall_threshold=%.3f "
-      "wall_min_inliers=%d wall_max_abs_normal_z=%.3f min_inliers=%d iterations=%d offset=%.3f",
+      "wall_min_inliers=%d wall_max_abs_normal_z=%.3f min_inliers=%d iterations=%d offset=%.3f "
+      "map_z_offset=%.3f",
       recent_cloud_count(), accumulation_frames, clouds.size(), roi_x_min_m, roi_x_max_m,
       roi_y_min_m, roi_y_max_m, roi_z_min_m, roi_z_max_m, robot_clearance_m, distance_threshold_m,
       default_max_plane_tilt_deg_, min_abs_normal_z, remove_walls_ ? "true" : "false",
       wall_distance_threshold_m, wall_min_inliers_, wall_max_abs_normal_z, min_inliers,
-      max_iterations, approach_offset_m);
+      max_iterations, approach_offset_m, map_z_offset_m);
 
     Point3 robot_position;
     try {
       publish_feedback(goal_handle, "looking_up_robot_tf", 10);
       robot_position = transform_origin(
-        tf_buffer_->lookupTransform(target_frame_, robot_frame_, tf2::TimePointZero));
+        tf_buffer_->lookupTransform(map_frame_, robot_frame_, tf2::TimePointZero));
     } catch (const tf2::TransformException & ex) {
       result->success = false;
       log_warn("find_bar_plane failed: Failed to lookup robot transform: %s", ex.what());
@@ -543,7 +546,7 @@ private:
 
     log_info(
       "Robot pose for extraction: frame=%s robot_frame=%s xy=(%.3f, %.3f)",
-      target_frame_.c_str(), robot_frame_.c_str(), robot_position.x, robot_position.y);
+      map_frame_.c_str(), robot_frame_.c_str(), robot_position.x, robot_position.y);
 
     std::vector<Point3> points;
     int used_frames = 0;
@@ -551,7 +554,7 @@ private:
     for (const auto & cloud : clouds) {
       try {
         const auto transform = tf_buffer_->lookupTransform(
-          target_frame_, cloud->header.frame_id, cloud->header.stamp,
+          map_frame_, cloud->header.frame_id, cloud->header.stamp,
           rclcpp::Duration::from_seconds(0.05));
         const auto frame_points = extract_points(
           *cloud, transform, robot_position, roi_x_min_m, roi_x_max_m, roi_y_min_m,
@@ -673,10 +676,10 @@ private:
       inlier_centroid.z *= inv_inliers;
 
       debug_plane_pub_->publish(
-        make_point_cloud_msg(points, inlier_indices, target_frame_, now()));
+        make_point_cloud_msg(points, inlier_indices, map_frame_, now()));
       log_info(
         "Published debug plane cloud: topic=%s points=%zu frame=%s",
-        debug_plane_topic_.c_str(), inlier_indices.size(), target_frame_.c_str());
+        debug_plane_topic_.c_str(), inlier_indices.size(), map_frame_.c_str());
 
       float plane_to_robot_x = robot_position.x - inlier_centroid.x;
       float plane_to_robot_y = robot_position.y - inlier_centroid.y;
@@ -722,13 +725,13 @@ private:
 
       result->target_x_m = edge_point.x + direction_x * approach_offset_m;
       result->target_y_m = edge_point.y + direction_y * approach_offset_m;
-      result->target_z_m = edge_point.z;
+      result->target_z_m = edge_point.z - map_z_offset_m;
       log_info(
         "Plane edge selected: edge=(%.3f, %.3f, %.3f) target=(%.3f, %.3f, %.3f) "
-        "distance_to_edge=%.3f offset=%.3f plane=[%.3f %.3f %.3f %.3f]",
+        "distance_to_edge=%.3f offset=%.3f map_z_offset=%.3f plane=[%.3f %.3f %.3f %.3f]",
         edge_point.x, edge_point.y, edge_point.z,
         result->target_x_m, result->target_y_m, result->target_z_m,
-        distance_to_edge, approach_offset_m,
+        distance_to_edge, approach_offset_m, map_z_offset_m,
         best_plane.a, best_plane.b, best_plane.c, best_plane.d);
       publish_feedback(goal_handle, "succeeded", 100);
     } else {
@@ -854,11 +857,12 @@ private:
   int wall_min_inliers_{};
   double wall_max_abs_normal_z_{};
   double default_approach_offset_m_{};
+  double map_z_offset_m_{};
   int default_min_inliers_{};
   int default_max_iterations_{};
   int default_accumulation_frames_{};
   int max_stored_frames_{};
-  std::string target_frame_;
+  std::string map_frame_;
   std::string robot_frame_;
   std::string debug_plane_topic_;
   std::string log_directory_;
