@@ -12,6 +12,7 @@ find_package(geometry_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_action REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(inha_interfaces REQUIRED)
@@ -24,6 +25,7 @@ ament_target_dependencies(find_start_bar_node
   rclcpp_action
   geometry_msgs
   sensor_msgs
+  std_msgs
   tf2
   tf2_ros
   inha_interfaces

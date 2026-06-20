@@ -25,6 +25,7 @@
 #include "rclcpp_action/rclcpp_action.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "sensor_msgs/msg/point_field.hpp"
+#include "std_msgs/msg/float32.hpp"
 #include "tf2/exceptions.h"
 #include "tf2_ros/buffer.h"
 #include "tf2_ros/transform_listener.h"
@@ -175,7 +176,7 @@ int field_offset(const sensor_msgs::msg::PointCloud2 & cloud, const std::string 
 
 std::vector<Point3> extract_points(
   const sensor_msgs::msg::PointCloud2 & cloud,
-  const geometry_msgs::msg::TransformStamped & cloud_to_map_transform,
+  const geometry_msgs::msg::TransformStamped & cloud_to_output_transform,
   const geometry_msgs::msg::TransformStamped & cloud_to_robot_transform,
   const float roi_x_min_m,
   const float roi_x_max_m,
@@ -225,8 +226,8 @@ std::vector<Point3> extract_points(
       continue;
     }
 
-    const Point3 map_point = transform_point({x, y, z}, cloud_to_map_transform);
-    points.push_back(map_point);
+    const Point3 output_point = transform_point({x, y, z}, cloud_to_output_transform);
+    points.push_back(output_point);
   }
 
   return points;
@@ -259,6 +260,70 @@ bool plane_from_points(const Point3 & p1, const Point3 & p2, const Point3 & p3, 
 float point_plane_distance(const Point3 & point, const Plane & plane)
 {
   return std::fabs(plane.a * point.x + plane.b * point.y + plane.c * point.z + plane.d);
+}
+
+Point3 centroid_from_indices(
+  const std::vector<Point3> & points,
+  const std::vector<size_t> & indices)
+{
+  Point3 centroid;
+  if (indices.empty()) {
+    return centroid;
+  }
+
+  for (const size_t index : indices) {
+    centroid.x += points[index].x;
+    centroid.y += points[index].y;
+    centroid.z += points[index].z;
+  }
+
+  const float inv_count = 1.0F / static_cast<float>(indices.size());
+  centroid.x *= inv_count;
+  centroid.y *= inv_count;
+  centroid.z *= inv_count;
+  return centroid;
+}
+
+bool select_robot_side_edge_point(
+  const std::vector<Point3> & points,
+  const std::vector<size_t> & indices,
+  const Point3 & inlier_centroid,
+  const Point3 & robot_position,
+  Point3 & edge_point,
+  float & distance_to_edge)
+{
+  if (indices.empty()) {
+    return false;
+  }
+
+  float plane_to_robot_x = robot_position.x - inlier_centroid.x;
+  float plane_to_robot_y = robot_position.y - inlier_centroid.y;
+  const float plane_to_robot_norm =
+    std::sqrt(plane_to_robot_x * plane_to_robot_x + plane_to_robot_y * plane_to_robot_y);
+  if (plane_to_robot_norm < 1.0e-6F) {
+    return false;
+  }
+
+  plane_to_robot_x /= plane_to_robot_norm;
+  plane_to_robot_y /= plane_to_robot_norm;
+
+  size_t edge_index = indices.front();
+  float best_edge_projection = -std::numeric_limits<float>::max();
+  for (const size_t index : indices) {
+    const float projection =
+      (points[index].x - inlier_centroid.x) * plane_to_robot_x +
+      (points[index].y - inlier_centroid.y) * plane_to_robot_y;
+    if (projection > best_edge_projection) {
+      best_edge_projection = projection;
+      edge_index = index;
+    }
+  }
+
+  edge_point = points[edge_index];
+  const float dx = robot_position.x - edge_point.x;
+  const float dy = robot_position.y - edge_point.y;
+  distance_to_edge = std::sqrt(dx * dx + dy * dy);
+  return true;
 }
 
 int remove_vertical_planes(
@@ -391,11 +456,11 @@ public:
   {
     cloud_topic_ = declare_parameter<std::string>("cloud_topic", "/livox/lidar");
     default_roi_x_min_m_ = declare_parameter<double>("roi_x_min_m", 0.0);
-    default_roi_x_max_m_ = declare_parameter<double>("roi_x_max_m", 1.5);
+    default_roi_x_max_m_ = declare_parameter<double>("roi_x_max_m", 2.3);
     default_roi_y_min_m_ = declare_parameter<double>("roi_y_min_m", -0.5);
     default_roi_y_max_m_ = declare_parameter<double>("roi_y_max_m", 0.5);
     default_roi_z_min_m_ = declare_parameter<double>("roi_z_min_m", 0.5);
-    default_roi_z_max_m_ = declare_parameter<double>("roi_z_max_m", 1.2);
+    default_roi_z_max_m_ = declare_parameter<double>("roi_z_max_m", 1.6);
     default_robot_clearance_m_ = declare_parameter<double>("robot_clearance_m", 0.45);
     default_distance_threshold_m_ = declare_parameter<double>("distance_threshold_m", 0.02);
     default_max_plane_tilt_deg_ = declare_parameter<double>("max_plane_tilt_deg", 10.0);
@@ -411,9 +476,12 @@ public:
     default_accumulation_frames_ = declare_parameter<int>("accumulation_frames", 10);
     max_stored_frames_ = declare_parameter<int>("max_stored_frames", 10);
     map_frame_ = declare_parameter<std::string>("map_frame", "map");
+    odom_frame_ = declare_parameter<std::string>("odom_frame", "odom");
     robot_frame_ = declare_parameter<std::string>("robot_frame", "base_nav");
     debug_plane_topic_ = declare_parameter<std::string>(
       "debug_plane_topic", "/find_start_bar/plane_inliers");
+    target_z_topic_ = declare_parameter<std::string>(
+      "target_z_topic", "/find_start_bar/target_z_m");
     log_directory_ = declare_parameter<std::string>(
       "log_directory", "/home/nvidia/inha_log/module/find_start_bar");
 
@@ -433,6 +501,10 @@ public:
       });
     debug_plane_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
       debug_plane_topic_, rclcpp::QoS(1).reliable());
+    target_z_pub_ = create_publisher<std_msgs::msg::Float32>(
+      target_z_topic_, rclcpp::QoS(1).reliable());
+    target_z_timer_ = create_wall_timer(
+      std::chrono::seconds(1), std::bind(&FindStartBarNode::publish_target_z, this));
 
     action_server_ = rclcpp_action::create_server<FindBarPlane>(
       this,
@@ -443,12 +515,14 @@ public:
 
     log_info(
       "FindStartBar action server ready. cloud_topic=%s action=find_bar_plane map_frame=%s "
-      "robot_frame=%s debug_plane_topic=%s roi_x=[%.2f, %.2f] roi_y=[%.2f, %.2f] roi_z=[%.2f, %.2f] "
+      "odom_frame=%s robot_frame=%s debug_plane_topic=%s target_z_topic=%s roi_x=[%.2f, %.2f] "
+      "roi_y=[%.2f, %.2f] roi_z=[%.2f, %.2f] "
       "robot_clearance=%.2f max_plane_tilt=%.1f deg map_z_offset=%.3f remove_walls=%s log_file=%s",
-      cloud_topic_.c_str(), map_frame_.c_str(), robot_frame_.c_str(),
-      debug_plane_topic_.c_str(), default_roi_x_min_m_, default_roi_x_max_m_,
-      default_roi_y_min_m_, default_roi_y_max_m_, default_roi_z_min_m_, default_roi_z_max_m_,
-      default_robot_clearance_m_, default_max_plane_tilt_deg_, map_z_offset_m_,
+      cloud_topic_.c_str(), map_frame_.c_str(), odom_frame_.c_str(), robot_frame_.c_str(),
+      debug_plane_topic_.c_str(), target_z_topic_.c_str(),
+      default_roi_x_min_m_, default_roi_x_max_m_, default_roi_y_min_m_, default_roi_y_max_m_,
+      default_roi_z_min_m_, default_roi_z_max_m_, default_robot_clearance_m_,
+      default_max_plane_tilt_deg_, map_z_offset_m_,
       remove_walls_ ? "true" : "false", log_file_path_.empty() ? "disabled" : log_file_path_.c_str());
   }
 
@@ -457,12 +531,19 @@ private:
     const rclcpp_action::GoalUUID &,
     std::shared_ptr<const FindBarPlane::Goal> goal)
   {
-    if (!goal || !goal->start) {
-      log_warn("Rejecting find_bar_plane goal: start=false");
+    if (!goal) {
+      log_warn("Rejecting find_bar_plane goal: goal is null");
       return rclcpp_action::GoalResponse::REJECT;
     }
 
-    log_info("Received find_bar_plane goal: start=true");
+    if (goal->frame != map_frame_ && goal->frame != odom_frame_) {
+      log_warn(
+        "Rejecting find_bar_plane goal: unsupported frame='%s' (allowed: '%s', '%s')",
+        goal->frame.c_str(), map_frame_.c_str(), odom_frame_.c_str());
+      return rclcpp_action::GoalResponse::REJECT;
+    }
+
+    log_info("Received find_bar_plane goal: frame=%s", goal->frame.c_str());
     return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
   }
 
@@ -475,14 +556,19 @@ private:
 
   void handle_accepted(const std::shared_ptr<GoalHandleFindBarPlane> goal_handle)
   {
-    log_info("find_bar_plane goal accepted");
-    std::thread{std::bind(&FindStartBarNode::execute, this, goal_handle)}.detach();
+    const size_t target_z_goal_sequence = pause_target_z_for_new_goal();
+    log_info("find_bar_plane goal accepted; target z topic publishing paused");
+    std::thread{
+      std::bind(&FindStartBarNode::execute, this, goal_handle, target_z_goal_sequence)}.detach();
   }
 
-  void execute(const std::shared_ptr<GoalHandleFindBarPlane> goal_handle)
+  void execute(
+    const std::shared_ptr<GoalHandleFindBarPlane> goal_handle,
+    const size_t target_z_goal_sequence)
   {
     const auto start_time = Clock::now();
     auto result = std::make_shared<FindBarPlane::Result>();
+    const std::string output_frame = goal_handle->get_goal()->frame;
     publish_feedback(goal_handle, "started", 0);
 
     std::vector<sensor_msgs::msg::PointCloud2::SharedPtr> clouds;
@@ -510,7 +596,7 @@ private:
       std::cos(default_max_plane_tilt_deg_ * kPi / 180.0));
     const float wall_distance_threshold_m = static_cast<float>(wall_distance_threshold_m_);
     const float wall_max_abs_normal_z = static_cast<float>(wall_max_abs_normal_z_);
-    const int min_inliers = default_min_inliers_;
+    const int min_inliers = std::max(1, default_min_inliers_);
     const int max_iterations = default_max_iterations_;
     const float approach_offset_m = static_cast<float>(default_approach_offset_m_);
     const float map_z_offset_m = static_cast<float>(map_z_offset_m_);
@@ -526,18 +612,18 @@ private:
       "robot_clearance=%.3f threshold=%.3f "
       "max_tilt=%.1fdeg min_abs_normal_z=%.3f remove_walls=%s wall_threshold=%.3f "
       "wall_min_inliers=%d wall_max_abs_normal_z=%.3f min_inliers=%d iterations=%d offset=%.3f "
-      "map_z_offset=%.3f",
+      "map_z_offset=%.3f output_frame=%s",
       recent_cloud_count(), accumulation_frames, clouds.size(), roi_x_min_m, roi_x_max_m,
       roi_y_min_m, roi_y_max_m, roi_z_min_m, roi_z_max_m, robot_clearance_m, distance_threshold_m,
       default_max_plane_tilt_deg_, min_abs_normal_z, remove_walls_ ? "true" : "false",
       wall_distance_threshold_m, wall_min_inliers_, wall_max_abs_normal_z, min_inliers,
-      max_iterations, approach_offset_m, map_z_offset_m);
+      max_iterations, approach_offset_m, map_z_offset_m, output_frame.c_str());
 
     Point3 robot_position;
     try {
       publish_feedback(goal_handle, "looking_up_robot_tf", 10);
       robot_position = transform_origin(
-        tf_buffer_->lookupTransform(map_frame_, robot_frame_, tf2::TimePointZero));
+        tf_buffer_->lookupTransform(output_frame, robot_frame_, tf2::TimePointZero));
     } catch (const tf2::TransformException & ex) {
       result->success = false;
       log_warn("find_bar_plane failed: Failed to lookup robot transform: %s", ex.what());
@@ -547,21 +633,21 @@ private:
 
     log_info(
       "Robot pose for extraction: frame=%s robot_frame=%s xy=(%.3f, %.3f)",
-      map_frame_.c_str(), robot_frame_.c_str(), robot_position.x, robot_position.y);
+      output_frame.c_str(), robot_frame_.c_str(), robot_position.x, robot_position.y);
 
     std::vector<Point3> points;
     int used_frames = 0;
     publish_feedback(goal_handle, "accumulating_clouds", 20);
     for (const auto & cloud : clouds) {
       try {
-        const auto cloud_to_map_transform = tf_buffer_->lookupTransform(
-          map_frame_, cloud->header.frame_id, cloud->header.stamp,
+        const auto cloud_to_output_transform = tf_buffer_->lookupTransform(
+          output_frame, cloud->header.frame_id, cloud->header.stamp,
           rclcpp::Duration::from_seconds(0.05));
         const auto cloud_to_robot_transform = tf_buffer_->lookupTransform(
           robot_frame_, cloud->header.frame_id, cloud->header.stamp,
           rclcpp::Duration::from_seconds(0.05));
         const auto frame_points = extract_points(
-          *cloud, cloud_to_map_transform, cloud_to_robot_transform, roi_x_min_m, roi_x_max_m,
+          *cloud, cloud_to_output_transform, cloud_to_robot_transform, roi_x_min_m, roi_x_max_m,
           roi_y_min_m, roi_y_max_m, roi_z_min_m, roi_z_max_m, robot_clearance_m);
         log_info(
           "Accumulated cloud frame: source_frame=%s raw_points=%u kept_points=%zu",
@@ -601,13 +687,16 @@ private:
       return;
     }
 
-    std::uniform_int_distribution<size_t> sample_index(0, points.size() - 1);
-
+    std::vector<Point3> remaining_plane_points = points;
     Plane best_plane;
     int best_inliers = 0;
+    int max_inliers = 0;
+    int candidate_planes = 0;
+    float best_edge_distance = std::numeric_limits<float>::max();
+    int search_round = 0;
     publish_feedback(goal_handle, "running_ransac", 40);
 
-    for (int iteration = 1; iteration <= max_iterations; ++iteration) {
+    while (remaining_plane_points.size() >= 3) {
       if (goal_handle->is_canceling()) {
         result->success = false;
         log_info("find_bar_plane canceled after %.2f ms", elapsed_ms(start_time));
@@ -615,38 +704,96 @@ private:
         return;
       }
 
-      const size_t i1 = sample_index(rng);
-      const size_t i2 = sample_index(rng);
-      const size_t i3 = sample_index(rng);
-      if (i1 == i2 || i1 == i3 || i2 == i3) {
-        continue;
-      }
+      std::uniform_int_distribution<size_t> sample_index(0, remaining_plane_points.size() - 1);
+      Plane extracted_plane;
+      std::vector<size_t> extracted_inliers;
 
-      Plane candidate;
-      if (!plane_from_points(points[i1], points[i2], points[i3], candidate)) {
-        continue;
-      }
-      if (std::fabs(candidate.c) < min_abs_normal_z) {
-        continue;
-      }
+      for (int iteration = 1; iteration <= max_iterations; ++iteration) {
+        if (goal_handle->is_canceling()) {
+          result->success = false;
+          log_info("find_bar_plane canceled after %.2f ms", elapsed_ms(start_time));
+          goal_handle->canceled(result);
+          return;
+        }
 
-      int inliers = 0;
-      for (const auto & point : points) {
-        if (point_plane_distance(point, candidate) <= distance_threshold_m) {
-          ++inliers;
+        const size_t i1 = sample_index(rng);
+        const size_t i2 = sample_index(rng);
+        const size_t i3 = sample_index(rng);
+        if (i1 == i2 || i1 == i3 || i2 == i3) {
+          continue;
+        }
+
+        Plane candidate;
+        if (!plane_from_points(
+            remaining_plane_points[i1], remaining_plane_points[i2], remaining_plane_points[i3],
+            candidate))
+        {
+          continue;
+        }
+        if (std::fabs(candidate.c) < min_abs_normal_z) {
+          continue;
+        }
+
+        std::vector<size_t> inliers;
+        inliers.reserve(remaining_plane_points.size());
+        for (size_t i = 0; i < remaining_plane_points.size(); ++i) {
+          if (point_plane_distance(remaining_plane_points[i], candidate) <= distance_threshold_m) {
+            inliers.push_back(i);
+          }
+        }
+
+        if (inliers.size() > extracted_inliers.size()) {
+          extracted_inliers = std::move(inliers);
+          extracted_plane = candidate;
+        }
+
+        if (iteration == 1 || iteration % 20 == 0 || iteration == max_iterations) {
+          const int progress =
+            40 + std::min(
+              50, search_round * 10 +
+              static_cast<int>((10.0 * static_cast<double>(iteration)) / max_iterations));
+          publish_feedback(goal_handle, "running_ransac", std::min(progress, 90));
         }
       }
 
-      if (inliers > best_inliers) {
-        best_inliers = inliers;
-        best_plane = candidate;
+      const int extracted_inlier_count = static_cast<int>(extracted_inliers.size());
+      max_inliers = std::max(max_inliers, extracted_inlier_count);
+      if (extracted_inlier_count < min_inliers) {
+        break;
       }
 
-      if (iteration == 1 || iteration % 20 == 0 || iteration == max_iterations) {
-        const int progress =
-          40 + static_cast<int>((50.0 * static_cast<double>(iteration)) / max_iterations);
-        publish_feedback(goal_handle, "running_ransac", std::min(progress, 90));
+      ++candidate_planes;
+      const Point3 candidate_centroid =
+        centroid_from_indices(remaining_plane_points, extracted_inliers);
+      Point3 candidate_edge_point;
+      float candidate_edge_distance{};
+      if (select_robot_side_edge_point(
+          remaining_plane_points, extracted_inliers, candidate_centroid, robot_position,
+          candidate_edge_point, candidate_edge_distance) &&
+        (candidate_edge_distance + 1.0e-6F < best_edge_distance ||
+        (std::fabs(candidate_edge_distance - best_edge_distance) <= 1.0e-6F &&
+        extracted_inlier_count > best_inliers)))
+      {
+        best_edge_distance = candidate_edge_distance;
+        best_inliers = extracted_inlier_count;
+        best_plane = extracted_plane;
       }
+
+      std::vector<bool> remove_mask(remaining_plane_points.size(), false);
+      for (const size_t index : extracted_inliers) {
+        remove_mask[index] = true;
+      }
+
+      std::vector<Point3> kept_points;
+      kept_points.reserve(remaining_plane_points.size() - extracted_inliers.size());
+      for (size_t i = 0; i < remaining_plane_points.size(); ++i) {
+        if (!remove_mask[i]) {
+          kept_points.push_back(remaining_plane_points[i]);
+        }
+      }
+
+      remaining_plane_points.swap(kept_points);
+      ++search_round;
     }
 
     result->success = best_inliers >= min_inliers;
@@ -654,16 +801,12 @@ private:
       publish_feedback(goal_handle, "computing_target", 90);
       std::vector<size_t> inlier_indices;
       inlier_indices.reserve(static_cast<size_t>(best_inliers));
-      Point3 inlier_centroid;
       for (size_t i = 0; i < points.size(); ++i) {
         if (point_plane_distance(points[i], best_plane) > distance_threshold_m) {
           continue;
         }
 
         inlier_indices.push_back(i);
-        inlier_centroid.x += points[i].x;
-        inlier_centroid.y += points[i].y;
-        inlier_centroid.z += points[i].z;
       }
 
       if (inlier_indices.empty()) {
@@ -674,22 +817,18 @@ private:
         return;
       }
 
-      const float inv_inliers = 1.0F / static_cast<float>(inlier_indices.size());
-      inlier_centroid.x *= inv_inliers;
-      inlier_centroid.y *= inv_inliers;
-      inlier_centroid.z *= inv_inliers;
-
       debug_plane_pub_->publish(
-        make_point_cloud_msg(points, inlier_indices, map_frame_, now()));
+        make_point_cloud_msg(points, inlier_indices, output_frame, now()));
       log_info(
         "Published debug plane cloud: topic=%s points=%zu frame=%s",
-        debug_plane_topic_.c_str(), inlier_indices.size(), map_frame_.c_str());
+        debug_plane_topic_.c_str(), inlier_indices.size(), output_frame.c_str());
 
-      float plane_to_robot_x = robot_position.x - inlier_centroid.x;
-      float plane_to_robot_y = robot_position.y - inlier_centroid.y;
-      const float plane_to_robot_norm =
-        std::sqrt(plane_to_robot_x * plane_to_robot_x + plane_to_robot_y * plane_to_robot_y);
-      if (plane_to_robot_norm < 1.0e-6F) {
+      const Point3 inlier_centroid = centroid_from_indices(points, inlier_indices);
+      Point3 edge_point;
+      float distance_to_edge{};
+      if (!select_robot_side_edge_point(
+          points, inlier_indices, inlier_centroid, robot_position, edge_point, distance_to_edge))
+      {
         result->success = false;
         log_warn(
           "find_bar_plane failed: Plane found, but robot is too close to the plane centroid direction.");
@@ -697,25 +836,6 @@ private:
         return;
       }
 
-      plane_to_robot_x /= plane_to_robot_norm;
-      plane_to_robot_y /= plane_to_robot_norm;
-
-      size_t edge_index = inlier_indices.front();
-      float best_edge_projection = -std::numeric_limits<float>::max();
-      for (const size_t index : inlier_indices) {
-        const float projection =
-          (points[index].x - inlier_centroid.x) * plane_to_robot_x +
-          (points[index].y - inlier_centroid.y) * plane_to_robot_y;
-        if (projection > best_edge_projection) {
-          best_edge_projection = projection;
-          edge_index = index;
-        }
-      }
-
-      const Point3 edge_point = points[edge_index];
-      const float dx = robot_position.x - edge_point.x;
-      const float dy = robot_position.y - edge_point.y;
-      const float distance_to_edge = std::sqrt(dx * dx + dy * dy);
       if (distance_to_edge < 1.0e-6F) {
         result->success = false;
         log_warn(
@@ -730,9 +850,11 @@ private:
       result->target_x_m = edge_point.x + direction_x * approach_offset_m;
       result->target_y_m = edge_point.y + direction_y * approach_offset_m;
       result->target_z_m = edge_point.z - map_z_offset_m;
+      set_target_z(result->target_z_m, target_z_goal_sequence);
       log_info(
-        "Plane edge selected: edge=(%.3f, %.3f, %.3f) target=(%.3f, %.3f, %.3f) "
+        "Plane edge selected: frame=%s edge=(%.3f, %.3f, %.3f) target=(%.3f, %.3f, %.3f) "
         "distance_to_edge=%.3f offset=%.3f map_z_offset=%.3f plane=[%.3f %.3f %.3f %.3f]",
+        output_frame.c_str(),
         edge_point.x, edge_point.y, edge_point.z,
         result->target_x_m, result->target_y_m, result->target_z_m,
         distance_to_edge, approach_offset_m, map_z_offset_m,
@@ -740,16 +862,19 @@ private:
       publish_feedback(goal_handle, "succeeded", 100);
     } else {
       log_warn(
-        "find_bar_plane failed: No horizontal plane reached min_inliers. "
-        "best_inliers=%d min_inliers=%d min_abs_normal_z=%.3f",
-        best_inliers, min_inliers, min_abs_normal_z);
+        "find_bar_plane failed: No closest horizontal plane candidate selected. "
+        "max_inliers=%d min_inliers=%d candidates=%d min_abs_normal_z=%.3f",
+        max_inliers, min_inliers, candidate_planes, min_abs_normal_z);
     }
 
     log_info(
-      "RANSAC result: success=%s frames=%d points=%zu inliers=%d threshold=%.3f "
+      "RANSAC result: success=%s frames=%d points=%zu selected_inliers=%d max_inliers=%d "
+      "candidates=%d selected_edge_distance=%.3f threshold=%.3f "
       "roi_x=[%.2f, %.2f] roi_y=[%.2f, %.2f] roi_z=[%.2f, %.2f] "
       "target=(%.3f, %.3f, %.3f) elapsed=%.2f ms",
       result->success ? "true" : "false", used_frames, points.size(), best_inliers,
+      max_inliers, candidate_planes,
+      best_edge_distance == std::numeric_limits<float>::max() ? -1.0F : best_edge_distance,
       distance_threshold_m, roi_x_min_m, roi_x_max_m, roi_y_min_m, roi_y_max_m,
       roi_z_min_m, roi_z_max_m,
       result->target_x_m, result->target_y_m, result->target_z_m,
@@ -834,6 +959,43 @@ private:
     return recent_clouds_.size();
   }
 
+  size_t pause_target_z_for_new_goal()
+  {
+    std::lock_guard<std::mutex> lock(target_z_mutex_);
+    has_target_z_ = false;
+    return ++target_z_goal_sequence_;
+  }
+
+  void set_target_z(const float target_z_m, const size_t goal_sequence)
+  {
+    {
+      std::lock_guard<std::mutex> lock(target_z_mutex_);
+      if (goal_sequence != target_z_goal_sequence_) {
+        return;
+      }
+      latest_target_z_m_ = target_z_m;
+      has_target_z_ = true;
+    }
+
+    log_info(
+      "Target z topic publishing resumed: topic=%s z=%.3f period=1.0s",
+      target_z_topic_.c_str(), target_z_m);
+  }
+
+  void publish_target_z()
+  {
+    std_msgs::msg::Float32 msg;
+    {
+      std::lock_guard<std::mutex> lock(target_z_mutex_);
+      if (!has_target_z_) {
+        return;
+      }
+      msg.data = latest_target_z_m_;
+    }
+
+    target_z_pub_->publish(msg);
+  }
+
   void publish_feedback(
     const std::shared_ptr<GoalHandleFindBarPlane> & goal_handle,
     const std::string & state,
@@ -867,18 +1029,26 @@ private:
   int default_accumulation_frames_{};
   int max_stored_frames_{};
   std::string map_frame_;
+  std::string odom_frame_;
   std::string robot_frame_;
   std::string debug_plane_topic_;
+  std::string target_z_topic_;
   std::string log_directory_;
   std::string log_file_path_;
 
   std::mutex cloud_mutex_;
   std::mutex log_mutex_;
+  std::mutex target_z_mutex_;
+  bool has_target_z_{false};
+  float latest_target_z_m_{};
+  size_t target_z_goal_sequence_{0};
   Clock::time_point last_throttled_file_log_time_{};
   std::deque<sensor_msgs::msg::PointCloud2::SharedPtr> recent_clouds_;
   std::ofstream log_file_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr debug_plane_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float32>::SharedPtr target_z_pub_;
+  rclcpp::TimerBase::SharedPtr target_z_timer_;
   rclcpp_action::Server<FindBarPlane>::SharedPtr action_server_;
   std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
   std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
