@@ -113,6 +113,14 @@ struct Plane
   float d{};
 };
 
+struct PlaneCandidate
+{
+  Plane plane;
+  float height{};
+  float distance{};
+  int inlier_count{};
+};
+
 Point3 transform_point(const Point3 & point, const geometry_msgs::msg::TransformStamped & transform)
 {
   const auto & q = transform.transform.rotation;
@@ -324,46 +332,26 @@ Point3 median_from_indices(
     median_value(std::move(z_values))};
 }
 
-bool select_robot_side_edge_point(
+float nearest_plane_xy_distance(
   const std::vector<Point3> & points,
   const std::vector<size_t> & indices,
-  const Point3 & inlier_centroid,
-  const Point3 & robot_position,
-  Point3 & edge_point,
-  float & distance_to_edge)
+  const Point3 & robot_position)
 {
   if (indices.empty()) {
-    return false;
+    return std::numeric_limits<float>::max();
   }
 
-  float plane_to_robot_x = robot_position.x - inlier_centroid.x;
-  float plane_to_robot_y = robot_position.y - inlier_centroid.y;
-  const float plane_to_robot_norm =
-    std::sqrt(plane_to_robot_x * plane_to_robot_x + plane_to_robot_y * plane_to_robot_y);
-  if (plane_to_robot_norm < 1.0e-6F) {
-    return false;
-  }
-
-  plane_to_robot_x /= plane_to_robot_norm;
-  plane_to_robot_y /= plane_to_robot_norm;
-
-  size_t edge_index = indices.front();
-  float best_edge_projection = -std::numeric_limits<float>::max();
+  float nearest_distance_sq = std::numeric_limits<float>::max();
   for (const size_t index : indices) {
-    const float projection =
-      (points[index].x - inlier_centroid.x) * plane_to_robot_x +
-      (points[index].y - inlier_centroid.y) * plane_to_robot_y;
-    if (projection > best_edge_projection) {
-      best_edge_projection = projection;
-      edge_index = index;
+    const float dx = robot_position.x - points[index].x;
+    const float dy = robot_position.y - points[index].y;
+    const float distance_sq = dx * dx + dy * dy;
+    if (distance_sq < nearest_distance_sq) {
+      nearest_distance_sq = distance_sq;
     }
   }
 
-  edge_point = points[edge_index];
-  const float dx = robot_position.x - edge_point.x;
-  const float dy = robot_position.y - edge_point.y;
-  distance_to_edge = std::sqrt(dx * dx + dy * dy);
-  return true;
+  return std::sqrt(nearest_distance_sq);
 }
 
 int remove_vertical_planes(
@@ -503,6 +491,8 @@ public:
     default_roi_z_max_m_ = declare_parameter<double>("roi_z_max_m", 1.6);
     default_robot_clearance_m_ = declare_parameter<double>("robot_clearance_m", 0.45);
     default_distance_threshold_m_ = declare_parameter<double>("distance_threshold_m", 0.02);
+    near_plane_distance_margin_m_ = declare_parameter<double>(
+      "near_plane_distance_margin_m", 0.10);
     default_max_plane_tilt_deg_ = declare_parameter<double>("max_plane_tilt_deg", 10.0);
     remove_walls_ = declare_parameter<bool>("remove_walls", true);
     wall_max_planes_ = declare_parameter<int>("wall_max_planes", 2);
@@ -556,12 +546,13 @@ public:
       "FindStartBar action server ready. cloud_topic=%s action=find_bar_plane map_frame=%s "
       "odom_frame=%s robot_frame=%s debug_plane_topic=%s target_z_topic=%s roi_x=[%.2f, %.2f] "
       "roi_y=[%.2f, %.2f] roi_z=[%.2f, %.2f] "
-      "robot_clearance=%.2f max_plane_tilt=%.1f deg map_z_offset=%.3f remove_walls=%s log_file=%s",
+      "robot_clearance=%.2f near_plane_margin=%.2f max_plane_tilt=%.1f deg "
+      "map_z_offset=%.3f remove_walls=%s log_file=%s",
       cloud_topic_.c_str(), map_frame_.c_str(), odom_frame_.c_str(), robot_frame_.c_str(),
       debug_plane_topic_.c_str(), target_z_topic_.c_str(),
       default_roi_x_min_m_, default_roi_x_max_m_, default_roi_y_min_m_, default_roi_y_max_m_,
       default_roi_z_min_m_, default_roi_z_max_m_, default_robot_clearance_m_,
-      default_max_plane_tilt_deg_, map_z_offset_m_,
+      near_plane_distance_margin_m_, default_max_plane_tilt_deg_, map_z_offset_m_,
       remove_walls_ ? "true" : "false", log_file_path_.empty() ? "disabled" : log_file_path_.c_str());
   }
 
@@ -631,6 +622,8 @@ private:
     const float roi_z_max_m = static_cast<float>(default_roi_z_max_m_);
     const float robot_clearance_m = static_cast<float>(default_robot_clearance_m_);
     const float distance_threshold_m = static_cast<float>(default_distance_threshold_m_);
+    const float near_plane_distance_margin_m = static_cast<float>(
+      std::max(0.0, near_plane_distance_margin_m_));
     const float min_abs_normal_z = static_cast<float>(
       std::cos(default_max_plane_tilt_deg_ * kPi / 180.0));
     const float wall_distance_threshold_m = static_cast<float>(wall_distance_threshold_m_);
@@ -647,13 +640,14 @@ private:
     log_info(
       "Starting plane extraction: buffered_frames=%zu requested_frames=%d used_candidates=%zu "
       "roi_x=[%.3f, %.3f] roi_y=[%.3f, %.3f] roi_z=[%.3f, %.3f] "
-      "robot_clearance=%.3f threshold=%.3f "
+      "robot_clearance=%.3f threshold=%.3f near_plane_margin=%.3f "
       "max_tilt=%.1fdeg min_abs_normal_z=%.3f remove_walls=%s wall_threshold=%.3f "
       "wall_min_inliers=%d wall_max_abs_normal_z=%.3f min_inliers=%d iterations=%d "
       "map_z_offset=%.3f output_frame=%s",
       recent_cloud_count(), accumulation_frames, clouds.size(), roi_x_min_m, roi_x_max_m,
       roi_y_min_m, roi_y_max_m, roi_z_min_m, roi_z_max_m, robot_clearance_m, distance_threshold_m,
-      default_max_plane_tilt_deg_, min_abs_normal_z, remove_walls_ ? "true" : "false",
+      near_plane_distance_margin_m, default_max_plane_tilt_deg_, min_abs_normal_z,
+      remove_walls_ ? "true" : "false",
       wall_distance_threshold_m, wall_min_inliers_, wall_max_abs_normal_z, min_inliers,
       max_iterations, map_z_offset_m, output_frame.c_str());
 
@@ -732,6 +726,8 @@ private:
     int candidate_planes = 0;
     float best_plane_height = -std::numeric_limits<float>::max();
     float best_edge_distance = std::numeric_limits<float>::max();
+    float nearest_candidate_distance = std::numeric_limits<float>::max();
+    std::vector<PlaneCandidate> plane_candidates;
     int search_round = 0;
     publish_feedback(goal_handle, "running_ransac", 40);
 
@@ -804,22 +800,11 @@ private:
       ++candidate_planes;
       const Point3 candidate_centroid =
         centroid_from_indices(remaining_plane_points, extracted_inliers);
-      Point3 candidate_edge_point;
-      float candidate_edge_distance = std::numeric_limits<float>::max();
-      select_robot_side_edge_point(
-        remaining_plane_points, extracted_inliers, candidate_centroid, robot_position,
-        candidate_edge_point, candidate_edge_distance);
-      if (candidate_centroid.z > best_plane_height + 1.0e-6F ||
-        (std::fabs(candidate_centroid.z - best_plane_height) <= 1.0e-6F &&
-        (candidate_edge_distance + 1.0e-6F < best_edge_distance ||
-        (std::fabs(candidate_edge_distance - best_edge_distance) <= 1.0e-6F &&
-        extracted_inlier_count > best_inliers))))
-      {
-        best_plane_height = candidate_centroid.z;
-        best_edge_distance = candidate_edge_distance;
-        best_inliers = extracted_inlier_count;
-        best_plane = extracted_plane;
-      }
+      const float candidate_edge_distance = nearest_plane_xy_distance(
+        remaining_plane_points, extracted_inliers, robot_position);
+      plane_candidates.push_back(
+        {extracted_plane, candidate_centroid.z, candidate_edge_distance, extracted_inlier_count});
+      nearest_candidate_distance = std::min(nearest_candidate_distance, candidate_edge_distance);
 
       std::vector<bool> remove_mask(remaining_plane_points.size(), false);
       for (const size_t index : extracted_inliers) {
@@ -836,6 +821,26 @@ private:
 
       remaining_plane_points.swap(kept_points);
       ++search_round;
+    }
+
+    const float near_distance_limit =
+      nearest_candidate_distance + near_plane_distance_margin_m;
+    for (const auto & candidate : plane_candidates) {
+      if (candidate.distance > near_distance_limit + 1.0e-6F) {
+        continue;
+      }
+
+      if (candidate.height > best_plane_height + 1.0e-6F ||
+        (std::fabs(candidate.height - best_plane_height) <= 1.0e-6F &&
+        (candidate.distance + 1.0e-6F < best_edge_distance ||
+        (std::fabs(candidate.distance - best_edge_distance) <= 1.0e-6F &&
+        candidate.inlier_count > best_inliers))))
+      {
+        best_plane_height = candidate.height;
+        best_edge_distance = candidate.distance;
+        best_inliers = candidate.inlier_count;
+        best_plane = candidate.plane;
+      }
     }
 
     result->success = best_inliers >= min_inliers;
@@ -888,11 +893,15 @@ private:
 
     log_info(
       "RANSAC result: success=%s frames=%d points=%zu selected_inliers=%d max_inliers=%d "
-      "candidates=%d selected_height=%.3f selected_edge_distance=%.3f threshold=%.3f "
+      "candidates=%d nearest_candidate_distance=%.3f near_plane_margin=%.3f "
+      "selected_height=%.3f selected_edge_distance=%.3f threshold=%.3f "
       "roi_x=[%.2f, %.2f] roi_y=[%.2f, %.2f] roi_z=[%.2f, %.2f] "
       "target=(%.3f, %.3f, %.3f) elapsed=%.2f ms",
       result->success ? "true" : "false", used_frames, points.size(), best_inliers,
       max_inliers, candidate_planes,
+      nearest_candidate_distance == std::numeric_limits<float>::max() ?
+      -1.0F : nearest_candidate_distance,
+      near_plane_distance_margin_m,
       best_plane_height == -std::numeric_limits<float>::max() ? -1.0F : best_plane_height,
       best_edge_distance == std::numeric_limits<float>::max() ? -1.0F : best_edge_distance,
       distance_threshold_m, roi_x_min_m, roi_x_max_m, roi_y_min_m, roi_y_max_m,
@@ -1036,6 +1045,7 @@ private:
   double default_roi_z_max_m_{};
   double default_robot_clearance_m_{};
   double default_distance_threshold_m_{};
+  double near_plane_distance_margin_m_{};
   double default_max_plane_tilt_deg_{};
   bool remove_walls_{};
   int wall_max_planes_{};
