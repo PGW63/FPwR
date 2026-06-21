@@ -284,6 +284,46 @@ Point3 centroid_from_indices(
   return centroid;
 }
 
+float median_value(std::vector<float> values)
+{
+  if (values.empty()) {
+    return 0.0F;
+  }
+
+  const size_t middle = values.size() / 2U;
+  std::nth_element(values.begin(), values.begin() + middle, values.end());
+  const float upper = values[middle];
+  if ((values.size() % 2U) != 0U) {
+    return upper;
+  }
+
+  const float lower = *std::max_element(values.begin(), values.begin() + middle);
+  return 0.5F * (lower + upper);
+}
+
+Point3 median_from_indices(
+  const std::vector<Point3> & points,
+  const std::vector<size_t> & indices)
+{
+  std::vector<float> x_values;
+  std::vector<float> y_values;
+  std::vector<float> z_values;
+  x_values.reserve(indices.size());
+  y_values.reserve(indices.size());
+  z_values.reserve(indices.size());
+
+  for (const size_t index : indices) {
+    x_values.push_back(points[index].x);
+    y_values.push_back(points[index].y);
+    z_values.push_back(points[index].z);
+  }
+
+  return {
+    median_value(std::move(x_values)),
+    median_value(std::move(y_values)),
+    median_value(std::move(z_values))};
+}
+
 bool select_robot_side_edge_point(
   const std::vector<Point3> & points,
   const std::vector<size_t> & indices,
@@ -471,7 +511,6 @@ public:
     wall_max_abs_normal_z_ = declare_parameter<double>("wall_max_abs_normal_z", 0.25);
     default_min_inliers_ = declare_parameter<int>("min_inliers", 500);
     default_max_iterations_ = declare_parameter<int>("max_iterations", 300);
-    default_approach_offset_m_ = declare_parameter<double>("approach_offset_m", 0.5);
     map_z_offset_m_ = declare_parameter<double>("map_z_offset_m", -0.226);
     default_accumulation_frames_ = declare_parameter<int>("accumulation_frames", 10);
     max_stored_frames_ = declare_parameter<int>("max_stored_frames", 10);
@@ -598,7 +637,6 @@ private:
     const float wall_max_abs_normal_z = static_cast<float>(wall_max_abs_normal_z_);
     const int min_inliers = std::max(1, default_min_inliers_);
     const int max_iterations = default_max_iterations_;
-    const float approach_offset_m = static_cast<float>(default_approach_offset_m_);
     const float map_z_offset_m = static_cast<float>(map_z_offset_m_);
     const int accumulation_frames = default_accumulation_frames_;
 
@@ -611,13 +649,13 @@ private:
       "roi_x=[%.3f, %.3f] roi_y=[%.3f, %.3f] roi_z=[%.3f, %.3f] "
       "robot_clearance=%.3f threshold=%.3f "
       "max_tilt=%.1fdeg min_abs_normal_z=%.3f remove_walls=%s wall_threshold=%.3f "
-      "wall_min_inliers=%d wall_max_abs_normal_z=%.3f min_inliers=%d iterations=%d offset=%.3f "
+      "wall_min_inliers=%d wall_max_abs_normal_z=%.3f min_inliers=%d iterations=%d "
       "map_z_offset=%.3f output_frame=%s",
       recent_cloud_count(), accumulation_frames, clouds.size(), roi_x_min_m, roi_x_max_m,
       roi_y_min_m, roi_y_max_m, roi_z_min_m, roi_z_max_m, robot_clearance_m, distance_threshold_m,
       default_max_plane_tilt_deg_, min_abs_normal_z, remove_walls_ ? "true" : "false",
       wall_distance_threshold_m, wall_min_inliers_, wall_max_abs_normal_z, min_inliers,
-      max_iterations, approach_offset_m, map_z_offset_m, output_frame.c_str());
+      max_iterations, map_z_offset_m, output_frame.c_str());
 
     Point3 robot_position;
     try {
@@ -823,41 +861,18 @@ private:
         "Published debug plane cloud: topic=%s points=%zu frame=%s",
         debug_plane_topic_.c_str(), inlier_indices.size(), output_frame.c_str());
 
-      const Point3 inlier_centroid = centroid_from_indices(points, inlier_indices);
-      Point3 edge_point;
-      float distance_to_edge{};
-      if (!select_robot_side_edge_point(
-          points, inlier_indices, inlier_centroid, robot_position, edge_point, distance_to_edge))
-      {
-        result->success = false;
-        log_warn(
-          "find_bar_plane failed: Plane found, but robot is too close to the plane centroid direction.");
-        goal_handle->succeed(result);
-        return;
-      }
-
-      if (distance_to_edge < 1.0e-6F) {
-        result->success = false;
-        log_warn(
-          "find_bar_plane failed: Plane found, but robot is already on the selected edge point.");
-        goal_handle->succeed(result);
-        return;
-      }
-
-      const float direction_x = (robot_position.x - edge_point.x) / distance_to_edge;
-      const float direction_y = (robot_position.y - edge_point.y) / distance_to_edge;
-
-      result->target_x_m = edge_point.x + direction_x * approach_offset_m;
-      result->target_y_m = edge_point.y + direction_y * approach_offset_m;
-      result->target_z_m = edge_point.z - map_z_offset_m;
+      const Point3 plane_median = median_from_indices(points, inlier_indices);
+      result->target_x_m = plane_median.x;
+      result->target_y_m = plane_median.y;
+      result->target_z_m = plane_median.z - map_z_offset_m;
       set_target_z(result->target_z_m, target_z_goal_sequence);
       log_info(
-        "Plane edge selected: frame=%s edge=(%.3f, %.3f, %.3f) target=(%.3f, %.3f, %.3f) "
-        "distance_to_edge=%.3f offset=%.3f map_z_offset=%.3f plane=[%.3f %.3f %.3f %.3f]",
+        "Plane median selected: frame=%s median=(%.3f, %.3f, %.3f) "
+        "target=(%.3f, %.3f, %.3f) map_z_offset=%.3f plane=[%.3f %.3f %.3f %.3f]",
         output_frame.c_str(),
-        edge_point.x, edge_point.y, edge_point.z,
+        plane_median.x, plane_median.y, plane_median.z,
         result->target_x_m, result->target_y_m, result->target_z_m,
-        distance_to_edge, approach_offset_m, map_z_offset_m,
+        map_z_offset_m,
         best_plane.a, best_plane.b, best_plane.c, best_plane.d);
       publish_feedback(goal_handle, "succeeded", 100);
     } else {
@@ -1022,7 +1037,6 @@ private:
   double wall_distance_threshold_m_{};
   int wall_min_inliers_{};
   double wall_max_abs_normal_z_{};
-  double default_approach_offset_m_{};
   double map_z_offset_m_{};
   int default_min_inliers_{};
   int default_max_iterations_{};
