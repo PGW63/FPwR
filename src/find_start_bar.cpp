@@ -509,7 +509,7 @@ public:
     wall_distance_threshold_m_ = declare_parameter<double>("wall_distance_threshold_m", 0.03);
     wall_min_inliers_ = declare_parameter<int>("wall_min_inliers", 300);
     wall_max_abs_normal_z_ = declare_parameter<double>("wall_max_abs_normal_z", 0.25);
-    default_min_inliers_ = declare_parameter<int>("min_inliers", 500);
+    default_min_inliers_ = declare_parameter<int>("min_inliers", 300);
     default_max_iterations_ = declare_parameter<int>("max_iterations", 300);
     map_z_offset_m_ = declare_parameter<double>("map_z_offset_m", -0.226);
     default_accumulation_frames_ = declare_parameter<int>("accumulation_frames", 10);
@@ -730,6 +730,7 @@ private:
     int best_inliers = 0;
     int max_inliers = 0;
     int candidate_planes = 0;
+    float best_plane_height = -std::numeric_limits<float>::max();
     float best_edge_distance = std::numeric_limits<float>::max();
     int search_round = 0;
     publish_feedback(goal_handle, "running_ransac", 40);
@@ -804,14 +805,17 @@ private:
       const Point3 candidate_centroid =
         centroid_from_indices(remaining_plane_points, extracted_inliers);
       Point3 candidate_edge_point;
-      float candidate_edge_distance{};
-      if (select_robot_side_edge_point(
-          remaining_plane_points, extracted_inliers, candidate_centroid, robot_position,
-          candidate_edge_point, candidate_edge_distance) &&
+      float candidate_edge_distance = std::numeric_limits<float>::max();
+      select_robot_side_edge_point(
+        remaining_plane_points, extracted_inliers, candidate_centroid, robot_position,
+        candidate_edge_point, candidate_edge_distance);
+      if (candidate_centroid.z > best_plane_height + 1.0e-6F ||
+        (std::fabs(candidate_centroid.z - best_plane_height) <= 1.0e-6F &&
         (candidate_edge_distance + 1.0e-6F < best_edge_distance ||
         (std::fabs(candidate_edge_distance - best_edge_distance) <= 1.0e-6F &&
-        extracted_inlier_count > best_inliers)))
+        extracted_inlier_count > best_inliers))))
       {
+        best_plane_height = candidate_centroid.z;
         best_edge_distance = candidate_edge_distance;
         best_inliers = extracted_inlier_count;
         best_plane = extracted_plane;
@@ -877,18 +881,19 @@ private:
       publish_feedback(goal_handle, "succeeded", 100);
     } else {
       log_warn(
-        "find_bar_plane failed: No closest horizontal plane candidate selected. "
+        "find_bar_plane failed: No horizontal plane candidate selected. "
         "max_inliers=%d min_inliers=%d candidates=%d min_abs_normal_z=%.3f",
         max_inliers, min_inliers, candidate_planes, min_abs_normal_z);
     }
 
     log_info(
       "RANSAC result: success=%s frames=%d points=%zu selected_inliers=%d max_inliers=%d "
-      "candidates=%d selected_edge_distance=%.3f threshold=%.3f "
+      "candidates=%d selected_height=%.3f selected_edge_distance=%.3f threshold=%.3f "
       "roi_x=[%.2f, %.2f] roi_y=[%.2f, %.2f] roi_z=[%.2f, %.2f] "
       "target=(%.3f, %.3f, %.3f) elapsed=%.2f ms",
       result->success ? "true" : "false", used_frames, points.size(), best_inliers,
       max_inliers, candidate_planes,
+      best_plane_height == -std::numeric_limits<float>::max() ? -1.0F : best_plane_height,
       best_edge_distance == std::numeric_limits<float>::max() ? -1.0F : best_edge_distance,
       distance_threshold_m, roi_x_min_m, roi_x_max_m, roi_y_min_m, roi_y_max_m,
       roi_z_min_m, roi_z_max_m,
